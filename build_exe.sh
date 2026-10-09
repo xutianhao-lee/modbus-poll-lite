@@ -24,6 +24,10 @@ rm -f "$ROOT/dist/modbus_poll_lite_mdi.exe" "$ROOT/dist/modbus_slave.exe" 2>/dev
 #   serial / serial.tools.list_ports
 #     源码里包在 try/except ImportError 内（为了没装 pyserial 时优雅降级），
 #     不声明的话 exe 里串口会打不开，而且**不报错**
+#
+#   sv_ttk（用 --collect-data 收集，见下方命令）
+#     Windows 11 风格主题的数据文件在 sv_ttk/theme/，
+#     不打进去的话 exe 里主题静默失效（回退默认外观，同样不报错）
 HIDDEN=(
   --hidden-import modbus_poll_lite
   --hidden-import modbus_chart
@@ -46,6 +50,7 @@ PYTHONIOENCODING=utf-8 python -m PyInstaller \
   --exclude-module pytest \
   --exclude-module matplotlib \
   "${HIDDEN[@]}" \
+  --collect-data sv_ttk \
   "$SRC/modbus_poll_lite_mdi.py" 2>&1 | tail -3
 
 echo ""

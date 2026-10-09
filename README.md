@@ -2,7 +2,9 @@
 
 一个自主实现的 Modbus 主站调试工具，功能对标 Modbus Poll。
 
-免安装、免费使用、中文界面，内置机器人控制器 Modbus 从站地址表预设。
+![界面预览](docs/preview.png)
+
+免安装、免费使用、中文界面（Windows 11 风格），内置机器人控制器 Modbus 从站地址表预设。
 
 ---
 
@@ -26,7 +28,8 @@ modbus_poll_lite/
 │   ├── Modbus工具使用说明.txt
 │   └── 更新说明.txt                 本版功能与修复记录
 ├── docs/
-│   └── TODO.md                     开发记录（11 批迭代及验证结果）
+│   ├── TODO.md                     开发记录（17 批迭代及验证结果）
+│   └── preview.png                 界面预览（README 展示）
 ├── build/                          PyInstaller 中间产物（可删除）
 ├── build_exe.sh                    打包脚本
 ├── start_slave.bat                 启动从站（独立窗口，关闭即停止）
@@ -88,6 +91,7 @@ PYTHONIOENCODING=utf-8 python test_modbus_serial.py             # 串口 45 项
 
 - Python 3.8+（开发环境为 3.14）
 - **pyserial**（仅串口功能需要）：`python -m pip install pyserial`
+- **sv-ttk**（可选，Windows 11 风格界面）：`python -m pip install sv-ttk`（未安装时使用系统默认外观）
 - tkinter（Python 标准库自带）
 
 ### 源码修改注意事项

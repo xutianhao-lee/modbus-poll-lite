@@ -43,6 +43,11 @@ from modbus_chart import ChartWindow     # noqa: E402  实时曲线
 from modbus_testcenter import TestCenter  # noqa: E402  Test Center 手动构造报文
 
 try:
+    import sv_ttk                        # noqa: E402  Windows 11 风格主题（可选依赖）
+except ImportError:
+    sv_ttk = None
+
+try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
@@ -1506,6 +1511,11 @@ class PollLiteMDI(tk.Tk):
 
     def __init__(self):
         super().__init__()
+        if sv_ttk:                       # 装了 sv-ttk 就用 Windows 11 风格；没装回退系统默认
+            try:
+                sv_ttk.set_theme("light")
+            except Exception:
+                pass                     # 主题数据缺失等异常时静默回退，不影响主功能
         self.title(APP)
         self.geometry("560x120")
         self.areas = []
@@ -1756,6 +1766,19 @@ def selftest(show_dialog=True):
         except Exception as e:
             ok = False
             lines.append(f"  ✘ {name}    {type(e).__name__}: {e}")
+
+    try:
+        import sv_ttk
+        import tkinter as _tk
+        _probe = _tk._default_root or _tk.Tk()
+        _probe.withdraw()
+        sv_ttk.set_theme("light")                       # 直接试加载，验证主题数据完整
+        lines.append("  ✔ sv_ttk（Windows 11 风格主题）")
+    except ImportError:
+        lines.append("  ○ sv_ttk 未安装（界面将使用系统默认外观）")
+    except Exception as e:
+        ok = False
+        lines.append(f"  ✘ sv_ttk 主题数据加载失败：{type(e).__name__}: {e}")
 
     try:
         import serial.tools.list_ports as lp
