@@ -17,8 +17,8 @@ modbus_poll_lite/
 │   ├── modbus_serial.py            串口 RTU/ASCII + RTU/ASCII over TCP
 │   ├── modbus_testcenter.py        Test Center 手动构造报文
 │   └── modbus_tcp_slave.py         从站模拟器
-├── tests/                          回归测试（207 项）
-│   ├── test_modbus_poll_lite.py    单窗口 56 项 / 多窗口 106 项
+├── tests/                          回归测试（217 项）
+│   ├── test_modbus_poll_lite.py    单窗口 56 项 / 多窗口 116 项
 │   └── test_modbus_serial.py       串口协议栈 45 项
 ├── dist/                           打包产物（exe 不纳入版本库，须自行打包）与用户文档
 │   ├── modbus_poll_lite_mdi.exe    主站（免 Python 运行）
@@ -77,7 +77,7 @@ bash build_exe.sh
 ```bash
 cd tests
 PYTHONIOENCODING=utf-8 python test_modbus_poll_lite.py          # 单窗口 56 项
-PYTHONIOENCODING=utf-8 python test_modbus_poll_lite.py --mdi    # 多窗口 106 项
+PYTHONIOENCODING=utf-8 python test_modbus_poll_lite.py --mdi    # 多窗口 116 项
 PYTHONIOENCODING=utf-8 python test_modbus_serial.py             # 串口 45 项
 ```
 
@@ -150,8 +150,8 @@ dist/modbus_poll_lite_mdi.exe --selftest
 ## 与 Modbus Poll 的功能对比
 
 **已实现**：多窗口、串口 RTU/ASCII、RTU/ASCII over TCP、实时曲线、
-Test Center、掩码写 (22)、脉冲写（点动）、RTS toggle、地址扫描、缩放、
-条件着色、数据记录、报文监视、配置保存
+Test Center、掩码写 (22)、脉冲写（点动）、设备扫描、字节序 4 档、暂停轮询、
+RTS toggle、地址扫描、缩放、条件着色、数据记录、报文监视、配置保存
 
 **尚未实现**：
 - UDP 系列（3 种）

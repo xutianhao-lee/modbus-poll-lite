@@ -584,7 +584,77 @@ if USE_MDI:
     if app.test_win and app.test_win.winfo_exists():
         app.test_win.destroy()
 
-# 2.14 掩码写 / 脉冲写（扩展写入，只有多窗口版有）
+# 2.14 字序 4 档 / 暂停轮询 / 设备扫描（只有多窗口版有）
+if USE_MDI:
+    app.mb.connect("127.0.0.1", 502, 1, 3.0)
+
+    # 字序 4 档：同一数值的四种寄存器摆放都能解析回 24.2563
+    app.fc, app.fmt, app.scale, app.offset, app.unit = 3, "Float", 1, 0, ""
+    _cases = [("ABCD（大端）", [16834, 3311]),
+              ("CDAB（字交换）", [3311, 16834]),
+              ("BADC（字节交换）", [49729, 61196]),
+              ("DCBA（全交换）", [61196, 49729])]
+    _ok4 = True
+    for _name, _vv in _cases:
+        app.word_order = _name
+        if app._format_value(_vv, 0) != "24.2563":
+            _ok4 = False
+    check("字序 4 档（ABCD/CDAB/BADC/DCBA）解析一致", _ok4)
+
+    app.fmt = "Long"
+    app.word_order = "CDAB（字交换）"
+    check("Long 32 位（CDAB 字交换）", app._format_value([58550, 4], 0) == "320694")
+
+    app.fmt = "Float"
+    app.word_order = mpl.WORD_ORDERS[1]                 # 旧配置里的「低位在前 (Little)」
+    check("旧配置字序值兼容（低位在前 → CDAB）",
+          app._format_value([3311, 16834], 0) == "24.2563")
+    app.word_order = tmod.ORDER4[0]
+    app.fmt = "Signed"
+
+    # 暂停轮询：真实跑轮询线程，按 Tx 计数判断停/走
+    app.fc, app.addr, app.qty = 3, 32768, 10
+    app.enabled, app.scan_rate = True, 100
+    app._start_poll()
+    time.sleep(0.5)
+    root.update()
+    _tx0 = app.mb.tx
+    time.sleep(0.5)
+    root.update()
+    check("轮询运行中（Tx 持续增长）", app.mb.tx > _tx0, f"tx {_tx0}→{app.mb.tx}")
+
+    app.var_pause.set(True)
+    app._toggle_pause()
+    time.sleep(0.25)                                    # 等在途请求收尾
+    root.update()
+    _tx1 = app.mb.tx
+    time.sleep(0.6)
+    root.update()
+    check("暂停后轮询停止（Tx 不再增长）", app.mb.tx == _tx1, f"tx {_tx1}→{app.mb.tx}")
+
+    app.var_pause.set(False)
+    app._toggle_pause()
+    time.sleep(0.5)
+    root.update()
+    check("恢复后轮询继续（Tx 增长）", app.mb.tx > _tx1)
+    app.enabled = False
+    app._stop_poll()
+
+    # 设备扫描：probe_tcp 探测 + 窗口构建
+    _ok, _detail = app.probe_tcp("127.0.0.1", 502, 1, 0.5)
+    check("设备扫描：探测到本机从站", _ok, _detail)
+    _ok, _ = app.probe_tcp("127.0.0.1", 5099, 1, 0.3)
+    check("设备扫描：无服务端口判为未发现", _ok is False)
+    _ok, _ = app.probe_tcp("127.0.0.1", 502, 99, 0.5)
+    check("设备扫描：不存在的从站号判为未发现", _ok is False)
+
+    app.dlg_scanner()
+    root.update()
+    check("设备扫描窗口构建", app.scanner_win is not None and app.scanner_win.winfo_exists())
+    if app.scanner_win and app.scanner_win.winfo_exists():
+        app.scanner_win.destroy()
+
+# 2.15 掩码写 / 脉冲写（扩展写入，只有多窗口版有）
 if USE_MDI:
     app.mb.connect("127.0.0.1", 502, 1, 3.0)
 
@@ -629,7 +699,7 @@ if USE_MDI:
         time.sleep(0.05)
     check("线圈脉冲到期恢复", app.mb.read(1, 4100, 1) == [False])
 
-# 2.15 弹窗零报错
+# 2.16 弹窗零报错
 check("测试期间无错误弹窗", not _errors, str(_errors[:2]) if _errors else "")
 
 if USE_MDI and root is not None:

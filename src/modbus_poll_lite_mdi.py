@@ -20,6 +20,8 @@ Modbus Poll Lite —— 多窗口版（MDI）
     CSV 记录 / 配置保存 / 地址扫描）与单窗口版完全一致。
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
 import json
 import os
 import queue
@@ -48,6 +50,29 @@ except Exception:
 APP = "Modbus Poll Lite MDI"
 DEFAULT_GEOM = "980x520"
 
+# 32 位字节序（4 档）：覆盖字交换与字节交换两个维度
+ORDER4 = ["ABCD（大端）", "CDAB（字交换）", "BADC（字节交换）", "DCBA（全交换）"]
+
+
+def _order_of(word_order):
+    """归一化字节序：兼容旧配置里「高位在前 / 低位在前」两档值"""
+    if word_order.startswith("低位"):
+        return "CDAB"
+    if word_order.startswith("高位"):
+        return "ABCD"
+    code = word_order[:4]
+    return code if code in ("ABCD", "CDAB", "BADC", "DCBA") else "ABCD"
+
+
+def _order4_label(word_order):
+    code = _order_of(word_order)
+    return next(x for x in ORDER4 if x.startswith(code))
+
+
+def _swap16(v):
+    """16 位字内字节交换：0x41C2 → 0xC241"""
+    return ((v & 0xFF) << 8) | (v >> 8)
+
 
 # ==================================================================== 数据区
 
@@ -75,8 +100,9 @@ class DataArea(tk.Toplevel):
         self.qty = 10
         self.scan_rate = 1000
         self.enabled = False
+        self.poll_paused = False
         self.fmt = "Signed"
-        self.word_order = core.WORD_ORDERS[0]
+        self.word_order = ORDER4[0]
         self.max_rows = 10
         self.var_base = tk.IntVar(value=0)
 
@@ -131,6 +157,9 @@ class DataArea(tk.Toplevel):
         ttk.Button(bar, text="连接 (F3)", command=self.dlg_connect).pack(side="left")
         ttk.Button(bar, text="断开", command=self._disconnect).pack(side="left", padx=(4, 10))
         ttk.Button(bar, text="读写定义 (F8)", command=self.dlg_definition).pack(side="left", padx=(0, 10))
+        self.var_pause = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="暂停轮询", variable=self.var_pause,
+                        command=self._toggle_pause).pack(side="left", padx=(0, 10))
         ttk.Label(bar, text="功能码:").pack(side="left")
         for code in (1, 2, 3, 4, 5, 6, 15, 16):
             ttk.Button(bar, text=f"{code:02d}", width=3,
@@ -371,8 +400,8 @@ class DataArea(tk.Toplevel):
         row(4, "Scan Rate（扫描周期 ms）", ttk.Entry(f, textvariable=v_rate, width=12))
         row(5, "显示格式", ttk.Combobox(f, textvariable=v_fmt, state="readonly",
                                      width=14, values=core.FORMATS))
-        row(6, "32 位字序", ttk.Combobox(f, textvariable=v_ord, state="readonly",
-                                      width=18, values=core.WORD_ORDERS))
+        row(6, "32 位字节序", ttk.Combobox(f, textvariable=v_ord, state="readonly",
+                                        width=18, values=ORDER4))
 
         ttk.Label(f, text="缩放").grid(row=7, column=0, sticky="w", pady=4)
         sc = ttk.Frame(f)
@@ -402,6 +431,7 @@ class DataArea(tk.Toplevel):
             ttk.Radiobutton(rr, text=str(n), variable=v_rows, value=n).pack(side="left", padx=6)
 
         ttk.Label(f, text="※ 地址一律填协议地址（从 0 起）。手册里的 40001 在这里就是 0。\n"
+                          "※ 数字栏均支持十六进制（0x 前缀）输入，如 0x80 = 128。\n"
                           "※ 03 保持寄存器上限 125 个，01/02 线圈上限 2000 个。\n"
                           "※ 缩放与条件着色只对 Signed / Unsigned / Float 生效。",
                   foreground="#666", justify="left").grid(row=11, column=0, columnspan=2,
@@ -740,10 +770,15 @@ class DataArea(tk.Toplevel):
         if self.fmt in ("Float", "Long"):
             if i + 1 >= len(vals):
                 return None
-            hi, lo = vals[i], vals[i + 1]
-            if self.word_order.startswith("低位"):
-                hi, lo = lo, hi
-            raw = struct.pack(">HH", hi, lo)
+            a, b = vals[i], vals[i + 1]
+            order = _order_of(self.word_order)
+            if order == "CDAB":                    # 字交换
+                a, b = b, a
+            elif order == "BADC":                  # 字节交换
+                a, b = _swap16(a), _swap16(b)
+            elif order == "DCBA":                  # 全交换
+                a, b = _swap16(b), _swap16(a)
+            raw = struct.pack(">HH", a, b)
             if self.fmt == "Float":
                 return float(struct.unpack(">f", raw)[0])
             return float(struct.unpack(">i", raw)[0])
@@ -800,6 +835,12 @@ class DataArea(tk.Toplevel):
         return f"{addr + base:05d}"
 
     # ------------------------------------------------------------ 轮询
+    def _toggle_pause(self):
+        """暂停/恢复轮询（不动连接，只让轮询循环跳过读取）"""
+        self.poll_paused = self.var_pause.get()
+        self._update_status()
+        self._refresh_grid()
+
     def _start_poll(self):
         self._stop_poll()
         self.stop_flag.clear()
@@ -814,7 +855,8 @@ class DataArea(tk.Toplevel):
 
     def _poll_loop(self):
         while not self.stop_flag.is_set():
-            if self.enabled and self.mb.connected and self.fc not in core.WRITE_FUNCS:
+            if (self.enabled and not self.poll_paused
+                    and self.mb.connected and self.fc not in core.WRITE_FUNCS):
                 try:
                     vals = self.mb.read(self.fc, self.addr, self.qty)
                     with self.data_lock:
@@ -924,6 +966,10 @@ class DataArea(tk.Toplevel):
             self.lbl_hint.configure(
                 foreground="#c60",
                 text="⚠ 已连接，但未启用轮询 —— 按 F8 勾选「Read/Write Enabled」。      " + hint)
+        elif self.poll_paused:
+            self.lbl_hint.configure(
+                foreground="#c60",
+                text="⏸ 轮询已暂停 —— 取消工具栏「暂停轮询」勾选即恢复。      " + hint)
         else:
             self.lbl_hint.configure(foreground="#666", text=hint)
 
@@ -933,7 +979,8 @@ class DataArea(tk.Toplevel):
         self.lbl_def.configure(
             text=f"Tx = {self.mb.tx}  Err = {self.mb.err}  ID = {self.slave_id}  "
                  f"F = {self.fc:02d}: SR = {self.scan_rate}ms"
-                 + ("" if self.enabled else "  (DISABLED)"))
+                 + ("" if self.enabled else "  (DISABLED)")
+                 + ("  (PAUSED)" if self.poll_paused else ""))
         if self.mb.connected:
             self.lbl_conn.configure(text=f"  ● {self.mb.peer}", foreground="#0a0")
             self.title(f"数据区 {self.index} —— {self.mb.peer}")
@@ -1042,7 +1089,7 @@ class DataArea(tk.Toplevel):
         self.qty = int(cfg.get("qty", 10))
         self.scan_rate = int(cfg.get("scan_rate", 1000))
         self.fmt = cfg.get("fmt", "Signed")
-        self.word_order = cfg.get("word_order", core.WORD_ORDERS[0])
+        self.word_order = _order4_label(cfg.get("word_order", ORDER4[0]))
         self.var_base.set(int(cfg.get("base", 0)))
         self.scale = float(cfg.get("scale", 1.0))
         self.offset = float(cfg.get("offset", 0.0))
@@ -1247,6 +1294,196 @@ class DataArea(tk.Toplevel):
         btn.configure(command=start)
         top.after(150, drain)
 
+    # ------------------------------------------------------------ 设备扫描
+    @staticmethod
+    def probe_tcp(ip, port, unit, timeout):
+        """探测 TCP 目标是否有 Modbus 服务。
+        返回 (found, detail)：found=True 表示有应答或返回了异常码。"""
+        m = core.ModbusMaster()
+        try:
+            m.connect(ip, port, unit, timeout)
+            try:
+                m.read(3, 0, 1)
+                return True, "✔ Modbus 应答"
+            except core.ModbusError as e:
+                return True, f"✔ Modbus 服务（异常码 {e.code:02d}）"
+        except Exception as e:
+            return False, type(e).__name__
+        finally:
+            try:
+                m.close()
+            except Exception:
+                pass
+
+    def dlg_scanner(self):
+        """Modbus 设备扫描器：扫 IP 网段找设备，或扫从站号找 Unit ID"""
+        top = tk.Toplevel(self)
+        top.title(f"Modbus 设备扫描 —— 数据区 {self.index}")
+        top.geometry("680x540")
+        top.transient(self)
+        self.scanner_win = top
+
+        v_mode = tk.StringVar(value="ip")
+        mf = ttk.LabelFrame(top, text="扫描模式", padding=8)
+        mf.pack(fill="x", padx=10, pady=(10, 4))
+        ttk.Radiobutton(mf, text="扫描 IP 网段 —— 网络里有哪些 Modbus 设备",
+                        variable=v_mode, value="ip").pack(anchor="w")
+        ttk.Radiobutton(mf, text="扫描从站号 1~247 —— 对已知设备找 Unit ID",
+                        variable=v_mode, value="unit").pack(anchor="w")
+
+        pf = ttk.Frame(top, padding=(10, 4))
+        pf.pack(fill="x")
+        parts = self.last_ip.rsplit(".", 1)
+        v_prefix = tk.StringVar(value=(parts[0] + ".") if len(parts) == 2 else "192.168.1.")
+        v_start = tk.StringVar(value="1")
+        v_end = tk.StringVar(value="254")
+        v_port = tk.StringVar(value=str(self.last_port))
+        v_unit = tk.StringVar(value=str(self.slave_id))
+        v_to = tk.StringVar(value="300")
+
+        ttk.Label(pf, text="网段前缀").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(pf, textvariable=v_prefix, width=16).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(pf, text="起止（0~255）").grid(row=1, column=0, sticky="w", pady=3)
+        le = ttk.Frame(pf)
+        le.grid(row=1, column=1, sticky="w", padx=8)
+        ttk.Entry(le, textvariable=v_start, width=5).pack(side="left")
+        ttk.Label(le, text=" ~ ").pack(side="left")
+        ttk.Entry(le, textvariable=v_end, width=5).pack(side="left")
+        ttk.Label(pf, text="端口").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Entry(pf, textvariable=v_port, width=8).grid(row=2, column=1, sticky="w", padx=8)
+        ttk.Label(pf, text="试读从站号").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Entry(pf, textvariable=v_unit, width=8).grid(row=3, column=1, sticky="w", padx=8)
+        ttk.Label(pf, text="响应超时 (ms)").grid(row=4, column=0, sticky="w", pady=3)
+        ttk.Entry(pf, textvariable=v_to, width=8).grid(row=4, column=1, sticky="w", padx=8)
+        ttk.Label(pf, text="※ 从站号扫描复用上次 TCP 连接的 IP/端口（先用 F3 连一次）；"
+                           "耗时约为 从站号数 × 超时。",
+                  foreground="#666").grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        res = ttk.Treeview(top, columns=("t", "s"), show="headings", height=12)
+        res.heading("t", text="目标")
+        res.heading("s", text="结果")
+        res.column("t", width=190, anchor="w")
+        res.column("s", width=450, anchor="w")
+        res.pack(fill="both", expand=True, padx=10)
+        res.tag_configure("ok", foreground="#080")
+
+        ctl = ttk.Frame(top, padding=10)
+        ctl.pack(fill="x")
+        btn = ttk.Button(ctl, text="开始扫描")
+        btn.pack(side="left")
+        lbl = ttk.Label(ctl, text="选好模式后点开始")
+        lbl.pack(side="left", padx=10)
+
+        q = queue.Queue()
+        state = {"running": False, "stop": False}
+
+        def drain():
+            while True:
+                try:
+                    kind, payload, *rest = q.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "row":
+                    res.insert("", "end", values=payload, tags=("ok",))
+                    res.see(res.get_children()[-1])
+                else:
+                    lbl.configure(text=payload)
+                    btn.configure(text="开始扫描")
+                    state["running"] = False
+            try:
+                if top.winfo_exists():
+                    top.after(150, drain)
+            except tk.TclError:
+                pass
+
+        def ip_worker(prefix, a0, a1, port, unit, timeout):
+            found = 0
+            ips = [f"{prefix}{n}" for n in range(a0, a1 + 1)]
+            probe = self.probe_tcp
+            with ThreadPoolExecutor(max_workers=40) as ex:
+                for ipx, (ok, _detail) in zip(
+                        ips, ex.map(lambda t: probe(t, port, unit, timeout), ips)):
+                    if state["stop"]:
+                        break
+                    if ok:
+                        found += 1
+                        q.put(("row", (ipx, _detail)))
+            q.put(("done", f"扫描完成：{len(ips)} 个地址，发现 {found} 个 Modbus 服务"))
+
+        def unit_worker(ip, port, timeout):
+            found = 0
+            m = core.ModbusMaster()
+            try:
+                m.connect(ip, port, 1, timeout)
+                for u in range(1, 248):
+                    if state["stop"]:
+                        break
+                    m.unit = u
+                    try:
+                        m.read(3, 0, 1)
+                        found += 1
+                        q.put(("row", (f"Unit {u}", "✔ Modbus 应答")))
+                    except core.ModbusError as e:
+                        found += 1
+                        q.put(("row", (f"Unit {u}",
+                                       f"✔ Modbus 服务（异常码 {e.code:02d}）")))
+                    except Exception:
+                        pass                       # 超时 = 该从站号无设备
+            except Exception as e:
+                q.put(("done", f"连接失败：{type(e).__name__}: {e}"))
+                return
+            finally:
+                try:
+                    m.close()
+                except Exception:
+                    pass
+            q.put(("done", f"扫描完成：从站号 1~247，发现 {found} 个应答"))
+
+        def start():
+            if state["running"]:
+                state["stop"] = True
+                lbl.configure(text="正在停止…")
+                return
+            try:
+                timeout = max(50, int(v_to.get(), 0)) / 1000.0
+                mode = v_mode.get()
+                if mode == "ip":
+                    prefix = v_prefix.get().strip()
+                    if prefix.count(".") != 3 or not prefix.endswith("."):
+                        raise ValueError("网段前缀格式如 192.168.1.（含最后的小点）")
+                    a0, a1 = int(v_start.get(), 0), int(v_end.get(), 0)
+                    if a1 < a0:
+                        a0, a1 = a1, a0
+                    if not 0 <= a0 <= 255 or not 0 <= a1 <= 255:
+                        raise ValueError("起止范围必须在 0 ~ 255 之间")
+                    port = int(v_port.get(), 0)
+                    if not 1 <= port <= 65535:
+                        raise ValueError("端口超出范围（1 ~ 65535）")
+                    unit = int(v_unit.get(), 0)
+                    if not 0 <= unit <= 255:
+                        raise ValueError("从站号超出范围（0 ~ 255）")
+                    lbl.configure(text=f"扫描中… {prefix}{a0}-{a1} : {port}")
+                    threading.Thread(target=ip_worker,
+                                     args=(prefix, a0, a1, port, unit, timeout),
+                                     daemon=True).start()
+                else:
+                    if self.last_type != "TCP":
+                        raise ValueError("从站号扫描需要 TCP —— 先用 F3 连接一次 TCP 从站")
+                    lbl.configure(text=f"扫描中… {self.last_ip}:{self.last_port}，"
+                                       f"从站号 1~247（约 {int(247 * timeout)} 秒）")
+                    threading.Thread(target=unit_worker,
+                                     args=(self.last_ip, self.last_port, timeout),
+                                     daemon=True).start()
+            except Exception as e:
+                messagebox.showerror("参数错误", str(e), parent=top)
+                return
+            res.delete(*res.get_children())
+            state["running"], state["stop"] = True, False
+            btn.configure(text="停止")
+
+        btn.configure(command=start)
+        top.after(150, drain)
+
     # ------------------------------------------------------------ 关闭
     def close(self):
         try:
@@ -1327,6 +1564,7 @@ class PollLiteMDI(tk.Tk):
 
         v = tk.Menu(m, tearoff=0)
         v.add_command(label="机器人地址表", command=lambda: dlg_robot_ranges(self))
+        v.add_command(label="Modbus 设备扫描…", command=self._c("dlg_scanner"))
         v.add_command(label="地址扫描…", command=self._c("dlg_scan"))
         m.add_cascade(label="视图", menu=v)
 
