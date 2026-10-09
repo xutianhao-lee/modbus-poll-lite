@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 打包产物（exe 不入库，用 build_exe.sh 现场打）
+build/
+dist/*.exe
+*.spec
+
+# 虚拟环境 / 编辑器
+.venv/
+venv/
+.vscode/
+.idea/

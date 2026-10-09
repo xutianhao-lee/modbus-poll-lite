@@ -1,0 +1,5 @@
+# 统一行尾：源码/脚本用 LF，Windows 批处理用 CRLF
+* text=auto
+*.bat text eol=crlf
+*.sh text eol=lf
+*.py text eol=lf
