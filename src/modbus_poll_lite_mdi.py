@@ -14,6 +14,7 @@ Modbus Poll Lite —— 多窗口版（MDI）
 差异（相对单窗口版）：
     · 多窗口：文件 → 新建数据区 / 关闭数据区；窗口菜单列出全部数据区
     · Base 0/1 基准是每个数据区各自持有的
+    · 扩展写入：掩码写寄存器 (22)、脉冲写（点动）
     · 菜单挂在主窗口上，作用于"当前活动数据区"（点一下窗口标题栏即可切换）
     其余操作（F3 连接 / F8 读写定义 / 双击写值 / 报文 / 缩放 / 着色 /
     CSV 记录 / 配置保存 / 地址扫描）与单窗口版完全一致。
@@ -37,7 +38,7 @@ if HERE not in sys.path:
 import modbus_poll_lite as core          # noqa: E402  复用核心
 import modbus_serial as ms               # noqa: E402  串口 RTU / ASCII
 from modbus_chart import ChartWindow     # noqa: E402  实时曲线
-from modbus_testcenter import TestCenter  # noqa: E402  Test Center 手搓报文
+from modbus_testcenter import TestCenter  # noqa: E402  Test Center 手动构造报文
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -499,6 +500,187 @@ class DataArea(tk.Toplevel):
             return
         self._read_once()
 
+    # ------------------------------------------------------------ 掩码写 / 脉冲写
+    def _sel_addr(self):
+        """当前选中行对应的协议地址；未选中返回 None"""
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("提示", "先在表格里选中一行")
+            return None
+        return self.addr + self.tree.index(sel[0]) * self._row_step()
+
+    def _parse_u16(self, text, title):
+        """解析 0 ~ 65535 整数（支持 0x 前缀）；非法时弹窗并返回 None"""
+        try:
+            v = int(text.strip(), 0)
+        except (ValueError, AttributeError):
+            messagebox.showerror(title, "请输入整数（可用 0x 前缀写十六进制）")
+            return None
+        if not 0 <= v <= 0xFFFF:
+            messagebox.showerror(title, "数值超出范围（0 ~ 65535）")
+            return None
+        return v
+
+    def _do_mask_write(self, addr, and_m, or_m):
+        """掩码写寄存器 (22)：结果 = (当前值 AND 掩码) OR (置位值 AND NOT 掩码)。
+        成功返回 True 并刷新；失败弹窗并返回 False。"""
+        try:
+            self.mb.request(struct.pack(">BHHH", 22, addr, and_m, or_m))
+        except core.ModbusError as e:
+            messagebox.showerror("从站返回异常", core.exc_text(e.code))
+            return False
+        except Exception as e:
+            messagebox.showerror("掩码写失败", str(e))
+            return False
+        self._read_once()
+        return True
+
+    def _mask_write_dialog(self):
+        addr = self._sel_addr()
+        if addr is None:
+            return
+
+        top = tk.Toplevel(self)
+        top.title(f"掩码写寄存器 (22)   地址 {addr}")
+        top.transient(self)
+        top.grab_set()
+        ttk.Label(top, text="只修改掩码指定的位，其余位保持不变：",
+                  padding=(12, 12, 12, 2)).pack(anchor="w")
+        ttk.Label(top, text="结果 = (当前值 AND 掩码) OR (置位值 AND NOT 掩码)",
+                  padding=(12, 0, 12, 8), foreground="#666").pack(anchor="w")
+
+        grid = ttk.Frame(top, padding=(12, 0, 12, 4))
+        grid.pack(fill="x")
+        ttk.Label(grid, text="AND 掩码（保留位）").grid(row=0, column=0, sticky="w", pady=3)
+        v_and = tk.StringVar(value="0xFFFF")
+        ttk.Entry(grid, textvariable=v_and, width=12).grid(row=0, column=1, padx=(8, 0), pady=3)
+        ttk.Label(grid, text="OR 置位（置 1 的位）").grid(row=1, column=0, sticky="w", pady=3)
+        v_or = tk.StringVar(value="0x0000")
+        e_or = ttk.Entry(grid, textvariable=v_or, width=12)
+        e_or.grid(row=1, column=1, padx=(8, 0), pady=3)
+        e_or.focus_set()
+
+        def ok(_e=None):
+            and_m = self._parse_u16(v_and.get(), "掩码格式错误")
+            if and_m is None:
+                return
+            or_m = self._parse_u16(v_or.get(), "掩码格式错误")
+            if or_m is None:
+                return
+            top.destroy()
+            self._do_mask_write(addr, and_m, or_m)
+
+        bf = ttk.Frame(top, padding=12)
+        bf.pack()
+        ttk.Button(bf, text="OK", command=ok).pack(side="left", padx=4)
+        ttk.Button(bf, text="Cancel", command=top.destroy).pack(side="left")
+        e_or.bind("<Return>", ok)
+        self.wait_window(top)
+
+    def _do_pulse_write(self, is_coil, addr, value, hold_ms, restore):
+        """脉冲写：写入 value → 保持 hold_ms 毫秒 → 恢复（0 或原值）。
+        is_coil=True 写线圈(05)，False 写寄存器(06)；restore=True 恢复原值。
+        成功发起返回 True（恢复由定时器完成）；失败弹窗并返回 False。
+        多次触发各自独立恢复，不做互斥。"""
+        orig = None
+        if restore:
+            try:
+                orig = self.mb.read(1 if is_coil else 3, addr, 1)[0]
+            except core.ModbusError as e:
+                messagebox.showerror("读取原值失败", core.exc_text(e.code))
+                return False
+            except Exception as e:
+                messagebox.showerror("读取原值失败", str(e))
+                return False
+        try:
+            if is_coil:
+                self.mb.write_single_coil(addr, bool(value))
+            else:
+                self.mb.write_single_register(addr, value & 0xFFFF)
+        except core.ModbusError as e:
+            messagebox.showerror("从站返回异常", core.exc_text(e.code))
+            return False
+        except Exception as e:
+            messagebox.showerror("脉冲写失败", str(e))
+            return False
+        self._read_once()
+
+        def restore_now():
+            back = orig if orig is not None else 0
+            try:
+                if is_coil:
+                    self.mb.write_single_coil(addr, bool(back))
+                else:
+                    self.mb.write_single_register(addr, back & 0xFFFF)
+                self._read_once()
+            except Exception:
+                pass          # 恢复时已断开等情况不再弹窗打扰
+
+        self.after(hold_ms, restore_now)
+        return True
+
+    def _pulse_write_dialog(self):
+        if self.fc in (1, 5):
+            is_coil = True
+        elif self.fc in (3, 6):
+            is_coil = False
+        else:
+            messagebox.showinfo("提示",
+                                f"功能码 {self.fc:02d} 不支持脉冲写。\n"
+                                "请切换到线圈 (01/05) 或 保持寄存器 (03/06) 数据区。")
+            return
+        addr = self._sel_addr()
+        if addr is None:
+            return
+
+        top = tk.Toplevel(self)
+        top.title("脉冲写（点动）")
+        top.transient(self)
+        top.grab_set()
+        ttk.Label(top, text=f"地址 {addr}：写入后保持指定时间，然后自动恢复",
+                  padding=(12, 12, 12, 6)).pack(anchor="w")
+
+        grid = ttk.Frame(top, padding=(12, 0, 12, 4))
+        grid.pack(fill="x")
+        ttk.Label(grid, text="脉冲值").grid(row=0, column=0, sticky="w", pady=3)
+        v_val = tk.StringVar(value="1" if is_coil else "0")
+        e_val = ttk.Entry(grid, textvariable=v_val, width=12)
+        e_val.grid(row=0, column=1, padx=(8, 0), pady=3)
+        ttk.Label(grid, text="保持时间 ms").grid(row=1, column=0, sticky="w", pady=3)
+        v_ms = tk.StringVar(value="500")
+        ttk.Entry(grid, textvariable=v_ms, width=12).grid(row=1, column=1, padx=(8, 0), pady=3)
+        e_val.focus_set()
+
+        v_restore = tk.BooleanVar(value=False)
+        ttk.Checkbutton(grid, text="结束后恢复原值（默认恢复为 0）",
+                        variable=v_restore).grid(row=2, column=0, columnspan=2,
+                                                 sticky="w", pady=(6, 0))
+
+        def ok(_e=None):
+            val = self._parse_u16(v_val.get(), "脉冲值错误")
+            if val is None:
+                return
+            if is_coil and val not in (0, 1):
+                messagebox.showerror("脉冲值错误", "线圈脉冲值只能是 0 或 1")
+                return
+            try:
+                ms = int(v_ms.get().strip(), 0)
+            except ValueError:
+                messagebox.showerror("时间格式错误", "保持时间请输入毫秒整数")
+                return
+            if not 50 <= ms <= 60000:
+                messagebox.showerror("时间超出范围", "保持时间范围 50 ~ 60000 ms")
+                return
+            top.destroy()
+            self._do_pulse_write(is_coil, addr, val, ms, v_restore.get())
+
+        bf = ttk.Frame(top, padding=12)
+        bf.pack()
+        ttk.Button(bf, text="OK", command=ok).pack(side="left", padx=4)
+        ttk.Button(bf, text="Cancel", command=top.destroy).pack(side="left")
+        e_val.bind("<Return>", ok)
+        self.wait_window(top)
+
     def _on_double_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
@@ -933,7 +1115,7 @@ class DataArea(tk.Toplevel):
         self.chart_win = ChartWindow(self)
 
     def dlg_testcenter(self):
-        """Test Center：手搓报文，看从站原始应答"""
+        """Test Center：手动构造报文，查看从站原始应答"""
         if self.test_win and self.test_win.winfo_exists():
             self.test_win.lift()
             self.test_win.focus_force()
@@ -1123,7 +1305,10 @@ class PollLiteMDI(tk.Tk):
         a.add_command(label="写多线圈 (15)…", command=self._c("_write_dialog", 15))
         a.add_command(label="写多寄存器 (16)…", command=self._c("_write_dialog", 16))
         a.add_separator()
-        a.add_command(label="Test Center（手搓报文）…", command=self._c("dlg_testcenter"))
+        a.add_command(label="掩码写寄存器 (22)…", command=self._c("_mask_write_dialog"))
+        a.add_command(label="脉冲写（点动）…", command=self._c("_pulse_write_dialog"))
+        a.add_separator()
+        a.add_command(label="Test Center（手动构造报文）…", command=self._c("dlg_testcenter"))
         m.add_cascade(label="数据区", menu=a)
 
         d = tk.Menu(m, tearoff=0)

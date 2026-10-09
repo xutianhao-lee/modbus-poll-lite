@@ -188,6 +188,26 @@ check("FC16 写多寄存器回读", m.read(3, 32781, 4) == [11, 22, 33, 44])
 m.write_multiple_coils(4101, [True, False, True, True])
 check("FC15 写多线圈回读", m.read(1, 4101, 4) == [True, False, True, True])
 
+# 1.3b 掩码写寄存器（FC22）
+m.write_single_register(32780, 0xFF00)
+try:
+    echo = m.request(mpl.struct.pack(">BHHH", 22, 32780, 0xFF0F, 0x00F0))
+except Exception:
+    echo = None
+check("FC22 响应回显请求", echo == mpl.struct.pack(">BHHH", 22, 32780, 0xFF0F, 0x00F0))
+check("FC22 结果 = (当前 AND 掩码) OR (置位 AND NOT 掩码)",
+      m.read(3, 32780, 1) == [0xFFF0], str(m.read(3, 32780, 1)))
+m.write_single_register(32780, 0x0000)
+m.request(mpl.struct.pack(">BHHH", 22, 32780, 0xFF00, 0x00FF))
+check("FC22 被掩码罩住的位保持 0，未罩住的位按 OR 置位",
+      m.read(3, 32780, 1) == [0x00FF], str(m.read(3, 32780, 1)))
+ok = False
+try:
+    m.request(mpl.struct.pack(">BHHH", 22, 0, 0xFFFF, 0x0000))
+except mpl.ModbusError as e:
+    ok = (e.code == 2)
+check("FC22 非法地址 → 异常码 02", ok)
+
 # 1.4 数量超限 -> 异常码 03
 ok = False
 try:
@@ -564,7 +584,52 @@ if USE_MDI:
     if app.test_win and app.test_win.winfo_exists():
         app.test_win.destroy()
 
-# 2.14 弹窗零报错
+# 2.14 掩码写 / 脉冲写（扩展写入，只有多窗口版有）
+if USE_MDI:
+    app.mb.connect("127.0.0.1", 502, 1, 3.0)
+
+    app.mb.write_single_register(32780, 0xFF00)
+    check("掩码写执行", app._do_mask_write(32780, 0xFF0F, 0x00F0))
+    check("掩码写结果 = (当前 AND 掩码) OR (置位 AND NOT 掩码)",
+          app.mb.read(3, 32780, 1) == [0xFFF0])
+
+    # 非法地址：预期弹一个错误框，先临时静默，避免污染"零弹窗"检查
+    _save_err = tmod.messagebox.showerror
+    tmod.messagebox.showerror = lambda *a, **k: None
+    try:
+        ok = app._do_mask_write(0, 0xFFFF, 0x0000)
+    finally:
+        tmod.messagebox.showerror = _save_err
+    check("掩码写非法地址被拒绝", ok is False)
+
+    app.mb.write_single_register(32781, 0x00AA)
+    check("脉冲写发起（恢复为 0）", app._do_pulse_write(False, 32781, 0x1234, 300, False))
+    check("脉冲写立即写入", app.mb.read(3, 32781, 1) == [0x1234])
+    _t0 = time.time()
+    while time.time() - _t0 < 1.0:
+        root.update()
+        time.sleep(0.05)
+    check("脉冲到期恢复为 0", app.mb.read(3, 32781, 1) == [0])
+
+    app.mb.write_single_register(32782, 0x00AA)
+    check("脉冲写（恢复原值）发起", app._do_pulse_write(False, 32782, 0x00BB, 300, True))
+    check("脉冲写（恢复原值）立即写入", app.mb.read(3, 32782, 1) == [0x00BB])
+    _t0 = time.time()
+    while time.time() - _t0 < 1.0:
+        root.update()
+        time.sleep(0.05)
+    check("脉冲到期恢复原值", app.mb.read(3, 32782, 1) == [0x00AA])
+
+    app.mb.write_single_coil(4100, False)
+    check("线圈脉冲发起", app._do_pulse_write(True, 4100, 1, 300, False))
+    check("线圈脉冲立即写入", app.mb.read(1, 4100, 1) == [True])
+    _t0 = time.time()
+    while time.time() - _t0 < 1.0:
+        root.update()
+        time.sleep(0.05)
+    check("线圈脉冲到期恢复", app.mb.read(1, 4100, 1) == [False])
+
+# 2.15 弹窗零报错
 check("测试期间无错误弹窗", not _errors, str(_errors[:2]) if _errors else "")
 
 if USE_MDI and root is not None:

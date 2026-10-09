@@ -7,6 +7,7 @@ modbus_tcp_slave.py —— 零依赖 Modbus TCP 从站模拟器（练手 / 自�
 
 支持功能码：01 读线圈 / 02 读离散输入 / 03 读保持寄存器 / 04 读输入寄存器
             05 写单线圈 / 06 写单寄存器 / 15 写多线圈 / 16 写多寄存器
+            22 掩码写寄存器
 不支持的功能码回异常码 01。
 
 两种模式：
@@ -49,7 +50,8 @@ DI = [False] * SIZE      # 离散输入 02
 LOCK = threading.Lock()
 
 FC_NAME = {1: "读线圈", 2: "读离散输入", 3: "读保持寄存器", 4: "读输入寄存器",
-           5: "写单线圈", 6: "写单寄存器", 15: "写多线圈", 16: "写多寄存器"}
+           5: "写单线圈", 6: "写单寄存器", 15: "写多线圈", 16: "写多寄存器",
+           22: "掩码写寄存器"}
 EXC_NAME = {1: "非法功能码", 2: "非法数据地址", 3: "非法数据值", 4: "从站设备故障"}
 
 
@@ -212,6 +214,22 @@ def handle_pdu(pdu, tag):
                 HR[idx + i] = struct.unpack(">H", pdu[6 + i * 2:8 + i * 2])[0]
         print(f"  {tag} {FC_NAME[fc]} 地址{addr} 数量{qty}")
         return struct.pack(">BHH", fc, addr, qty)
+
+    if fc == 22:
+        if len(pdu) < 7:
+            return exception(fc, 3)
+        addr, and_m, or_m = struct.unpack(">HHH", pdu[1:7])
+        with LOCK:
+            idx = to_index(3, addr, 1)
+            if idx is None:
+                print(f"  {tag} 掩码写寄存器 地址{addr} → 异常码 02（非法数据地址）")
+                return exception(fc, 2)
+            old = HR[idx]
+            # 规范语义：结果 = (当前值 AND 掩码) OR (置位值 AND NOT 掩码)
+            HR[idx] = (old & and_m) | (or_m & ~and_m & 0xFFFF)
+        print(f"  {tag} {FC_NAME[fc]} 地址{addr} AND=0x{and_m:04X} OR=0x{or_m:04X}"
+              f" → {old} → {HR[idx]}")
+        return pdu
 
     print(f"  {tag} 功能码 {fc} → 异常码 01（本模拟器不支持）")
     return exception(fc, 1)
