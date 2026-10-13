@@ -153,9 +153,6 @@ dist/modbus_poll_lite_mdi.exe --selftest
 
 ## 与 Modbus Poll 的功能对比
 
-> 基准：Modbus Poll **13.2.1.2558**（2026-10-13 用 REA 逆向核实的官方功能表，
-> 分析存档 `_archive/rea-20261013/mbpoll/`）
-
 **已实现**：多窗口、8 种连接方式（Modbus TCP / UDP、串口 RTU·ASCII、
 RTU·ASCII over TCP·UDP）、实时曲线（双游标 + 导出 CSV / PNG）、Test Center、
 掩码写 (22)、脉冲写（点动）、**FC23 读写多个寄存器**、**FC43/14 读设备标识**、

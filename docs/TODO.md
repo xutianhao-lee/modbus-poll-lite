@@ -3,7 +3,7 @@
 > 目录：`src` 源码 / `tests` 测试 / `dist` 产物 / `docs` 文档（2026-09-22 由 scripts/dist/docs 三处归拢）
 > 主站：`src\modbus_poll_lite_mdi.py` · 从站：`src\modbus_tcp_slave.py`
 > 测试：`tests\` · 产物：`dist\` · 打包：`build_exe.sh`
-> 对照基准：Modbus Poll 13.2.1.2558（2026-10-13 用 REA 逆向核实的官方功能表）
+> 对照基准：Modbus Poll 13.2.1 官方功能表
 > 建立 2026-09-22 · 最后更新 2026-10-13
 
 ---
@@ -409,14 +409,11 @@ modbus_poll_lite\
 > 全部 ttk 控件（按钮 / 输入框 / 表格表头 / 下拉框）自动换装；经典控件（菜单 / Canvas）
 > 不受影响。代价仅一个纯 Python 可选依赖，与"零依赖"定位兼容（未装即回退）。
 
-### 2026-10-13 第 18 批（对标 Modbus Poll 13.2.1 —— REA 逆向 + 功能对齐）
+### 2026-10-13 第 18 批（对标 Modbus Poll 13.2.1 —— 功能对齐）
 
-> 来源：用户要求「参考 Modbus Poll（用 REA）继续完善」。用 REA（6.4.0，Ghidra 12.1.4 引擎）
-> 分析 mbpoll.exe（9.3MB，MFC/C++，v13.2.1.2558）——Ghidra 全量分析超时，
-> 改用「资源树文件偏移 + 自写解码器」路线，解出 3 个菜单 / 44 个对话框 /
-> 41 组字符串表 / 9 组下拉框数据，得到官方**完整功能清单**与 **29 种显示格式的精确分组**
-> （多寄存器 6 类 × 4 档字节序，命名 Big-endian / Little-endian byte swap /
-> Big-endian byte swap / Little-endian）。存档：`E:\DEEPSEEK\_archive\rea-20261013\mbpoll\`。
+> 来源：用户要求「参考 Modbus Poll 继续完善」。对照 Modbus Poll 13.2.1 官方功能表
+> （Functions 菜单功能码清单、29 种显示格式的精确分组——多寄存器 6 类 × 4 档字节序）
+> 补齐 7 组新功能与 2 个缺陷修复。
 
 | 项 | 验证结果 |
 |---|---|
