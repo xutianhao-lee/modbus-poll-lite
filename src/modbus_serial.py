@@ -101,8 +101,12 @@ class RtuCodec:
         fc = head[1]
         if fc & 0x80:
             return 5
-        if fc in (1, 2, 3, 4):
-            return None                      # 要看第 3 字节 byte_count
+        if fc in (1, 2, 3, 4, 23):
+            return None                      # 要看第 3 字节 byte_count（23 应答同读响应）
+        if fc == 0x2B:
+            return None                      # 43/14 变长：按对象逐个累加（见 _recv_frame）
+        if fc == 22:
+            return 10                        # 22 掩码写：响应回显 7 字节 PDU（unit+fc+7+crc）
         return 8                             # 05/06/15/16 定长
 
 
@@ -274,6 +278,66 @@ class SocketTransport:
             pass
 
 
+class UdpTransport:
+    """把 UDP socket 当字节流用（带内部缓冲）。
+
+    用途：Modbus UDP（MBAP over UDP）、**RTU / ASCII over UDP** 两种协议变体，
+    以及给它们做无硬件端到端测试（本机从站 --udp 就监听 UDP）。
+
+    与 TCP 的区别：无连接、无重传；一收一发都按数据报走。
+    这里做一个字节缓冲，让上层（分帧逻辑）可以按需一段一段地"读"。
+    """
+
+    def __init__(self, ip, port, timeout=1.0):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(timeout)
+        self.sock.connect((ip, port))        # connect 后可用 send/recv，且只收该来源
+        self.timeout = timeout
+        self.buf = b""
+        self.description = f"{ip}:{port} (UDP)"
+
+    def sendall(self, data):
+        self.sock.send(data)
+
+    def _fill(self):
+        try:
+            chunk = self.sock.recv(4096)
+        except (socket.timeout, TimeoutError):
+            return False
+        if not chunk:
+            return False
+        self.buf += chunk
+        return True
+
+    def read_exact(self, n):
+        """读满 n 字节；超时读不满返回已读到的（可能短）"""
+        deadline = time.time() + self.timeout + 0.05
+        while len(self.buf) < n and time.time() < deadline:
+            if not self._fill():
+                break
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def read_until(self, terminator, limit=512):
+        deadline = time.time() + self.timeout + 0.05
+        while (terminator not in self.buf and len(self.buf) < limit
+               and time.time() < deadline):
+            if not self._fill():
+                break
+        idx = self.buf.find(terminator)
+        if idx >= 0:
+            out, self.buf = self.buf[:idx + len(terminator)], self.buf[idx + len(terminator):]
+            return out
+        out, self.buf = self.buf, b""
+        return out
+
+    def close(self):
+        try:
+            self.sock.close()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------- 主站
 
 class ModbusSerialMaster:
@@ -343,6 +407,28 @@ class ModbusSerialMaster:
         head = self.transport.read_exact(2)
         if len(head) < 2:
             raise TimeoutError(f"只收到 {len(head)} 字节，从站无响应")
+
+        # 43/14 应答是变长结构（对象个数不定），没法用一个 byte_count 推：
+        #   unit fc | mei code conf more next num | [id len val]×num | crc
+        if not (head[1] & 0x80) and head[1] == 0x2B:
+            rest = self.transport.read_exact(6)
+            if len(rest) < 6:
+                raise TimeoutError("读设备标识应答头超时")
+            num = rest[5]
+            objs = b""
+            for _ in range(num):
+                h = self.transport.read_exact(2)
+                if len(h) < 2:
+                    raise TimeoutError("读设备标识对象头超时")
+                body = self.transport.read_exact(h[1])
+                if len(body) < h[1]:
+                    raise TimeoutError("读设备标识对象值超时")
+                objs += h + body
+            tail = self.transport.read_exact(2)          # CRC
+            if len(tail) < 2:
+                raise TimeoutError("读设备标识应答尾（CRC）超时")
+            return head + rest + objs + tail
+
         need = self.codec.frame_length(head)
         if need is None:
             bc = self.transport.read_exact(1)
@@ -431,9 +517,150 @@ class ModbusSerialMaster:
         self.request(struct.pack(">BHHB", 15, addr, len(values), nbytes) + bytes(buf))
 
 
+class ModbusUdpMaster:
+    """Modbus UDP 主站（MBAP 帧直接打 UDP 数据报）。
+
+    公开接口与 modbus_poll_lite.ModbusMaster 一致
+    （connect/close/read/write_*/tx/err/connected/peer/traffic/on_traffic/unit）。
+
+    与 TCP 主站的区别：无连接；从站不响应就是超时（没有"连接被拒绝"这种即时反馈）。
+    一次请求 = 一个数据报，应答也按数据报收；tid 不匹配的迟到应答会被跳过。
+    """
+
+    def __init__(self):
+        self.sock = None
+        self.lock = threading.Lock()
+        self.tid = 0
+        self.unit = 1
+        self.timeout = 1.0
+        self.tx = 0
+        self.err = 0
+        self.connected = False
+        self.peer = ""
+        self.last_error = ""
+        self.traffic = []
+        self.on_traffic = None
+
+    def connect(self, ip, port, unit, timeout):
+        self.close()
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        s.connect((ip, port))
+        self.sock = s
+        self.unit = unit
+        self.timeout = timeout
+        self.connected = True
+        self.peer = f"{ip}:{port} (UDP)"
+        self.tx = self.err = 0
+        self.last_error = ""
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self.connected = False
+
+    def _log(self, direction, data, note=""):
+        line = (direction, data.hex(" ").upper(), note)
+        self.traffic.append(line)
+        if len(self.traffic) > 2000:
+            del self.traffic[:500]
+        if self.on_traffic:
+            try:
+                self.on_traffic(line)
+            except Exception:
+                pass
+
+    def request(self, pdu):
+        """发一个数据报，返回响应 PDU。异常响应抛 ModbusError。"""
+        import modbus_poll_lite as core
+
+        with self.lock:
+            if not self.sock:
+                raise ConnectionError("未连接")
+            if not 0 <= self.unit <= 255:
+                raise ValueError(f"从站号 {self.unit} 超出范围（0 ~ 255）")
+            self.tid = (self.tid + 1) & 0xFFFF
+            tid = self.tid
+            frame = struct.pack(">HHHB", tid, 0, len(pdu) + 1, self.unit) + pdu
+            self.tx += 1
+            self._log("Tx", frame)
+            self.sock.send(frame)
+            if self.unit == 0:                   # 广播：不应答
+                self.last_error = ""
+                return b""
+
+            deadline = time.time() + self.timeout + 0.05
+            while True:
+                remain = deadline - time.time()
+                if remain <= 0:
+                    self.err += 1
+                    self.last_error = "UDP 应答超时"
+                    raise TimeoutError("UDP 应答超时（从站未响应）")
+                self.sock.settimeout(remain)
+                try:
+                    data = self.sock.recv(4096)
+                except (socket.timeout, TimeoutError):
+                    continue
+                self._log("Rx", data)
+                if len(data) < 8:
+                    continue                      # 短包丢弃
+                rtid, _pid, length, _uid = struct.unpack(">HHHB", data[:7])
+                if rtid != tid:
+                    continue                      # 迟到/串台的应答，跳过
+                body = data[7:7 + max(0, length - 1)]
+                if body and (body[0] & 0x80):
+                    code = body[1] if len(body) > 1 else 0
+                    self.err += 1
+                    self.last_error = core.exc_text(code)
+                    raise core.ModbusError(code)
+                self.last_error = ""
+                return body
+
+    # -- 功能码（与 core 完全一致）--------------------------------------
+    def read(self, fc, addr, qty):
+        resp = self.request(struct.pack(">BHH", fc, addr, qty))
+        if fc in (1, 2):
+            nbytes = resp[1]
+            raw = resp[2:2 + nbytes]
+            return [bool(raw[i // 8] >> (i % 8) & 1) for i in range(qty)]
+        nbytes = resp[1]
+        return list(struct.unpack(">" + "H" * (nbytes // 2), resp[2:2 + nbytes]))
+
+    def write_single_register(self, addr, value):
+        self.request(struct.pack(">BHH", 6, addr, value & 0xFFFF))
+
+    def write_single_coil(self, addr, on):
+        self.request(struct.pack(">BHH", 5, addr, 0xFF00 if on else 0x0000))
+
+    def write_multiple_registers(self, addr, values):
+        body = b"".join(struct.pack(">H", v & 0xFFFF) for v in values)
+        self.request(struct.pack(">BHHB", 16, addr, len(values), len(body)) + body)
+
+    def write_multiple_coils(self, addr, values):
+        nbytes = (len(values) + 7) // 8
+        buf = bytearray(nbytes)
+        for i, v in enumerate(values):
+            if v:
+                buf[i // 8] |= 1 << (i % 8)
+        self.request(struct.pack(">BHHB", 15, addr, len(values), nbytes) + bytes(buf))
+
+
 def make_master(conn_type, **kw):
-    """按连接类型造主站。conn_type ∈ {'TCP','RTU','ASCII'}"""
-    if conn_type.upper() == "TCP":
+    """按连接类型造主站。
+
+    conn_type ∈ {'TCP','UDP','RTU','ASCII','RTU_TCP','ASCII_TCP','RTU_UDP','ASCII_UDP'}
+    网络类（TCP/UDP）返回已构造未连接的对象；串口/over-TCP/over-UDP 返回
+    ModbusSerialMaster，调用方再用 connect / connect_tcp / connect_transport 接管。
+    """
+    t = conn_type.upper()
+    if t == "TCP":
         import modbus_poll_lite as core
         return core.ModbusMaster()
-    return ModbusSerialMaster(mode=conn_type)
+    if t == "UDP":
+        return ModbusUdpMaster()
+    base = t.split("_")[0]                       # RTU / ASCII
+    return ModbusSerialMaster(mode=base)

@@ -62,6 +62,7 @@ def port_open(port=502):
 
 
 slave_proc = None
+extra_slaves = []          # 测试自己起的额外从站（如 UDP 专用），结束时一并清理
 if not port_open(502):
     print("从站未运行，自动启动…")
     slave_proc = subprocess.Popen(
@@ -546,6 +547,18 @@ if USE_MDI:
     _ms = (time.perf_counter() - _t0) / 10 * 1000
     check("重绘耗时有充足余量（<30ms，刷新周期 80ms）", _ms < 30, f"{_ms:.1f} ms/次")
 
+    # ---- 导出（CSV / PNG）----
+    _csv_p = os.path.join(tempfile.gettempdir(), "mpl_chart_export.csv")
+    _png_p = os.path.join(tempfile.gettempdir(), "mpl_chart_export.png")
+    _got = cw._export_csv_to(_csv_p)
+    _rows = open(_csv_p, encoding="utf-8-sig").read().strip().split("\n")
+    check("曲线导出 CSV（表头 + 各通道对齐）",
+          _got == _csv_p and _rows[0].startswith("时间(s),时刻") and len(_rows) > 100,
+          f"{len(_rows)} 行")
+    _got = cw._export_png_to(_png_p)
+    check("曲线导出图片（PNG，缺 Pillow 时回退 PS）",
+          os.path.exists(_got) and _got.endswith((".png", ".ps")), _got)
+
     cw._clear()
     check("曲线清空后无历史", len(cw.history) == 0)
     cw.destroy()
@@ -574,7 +587,7 @@ if USE_MDI:
     _t, r, _e = mtc.send_pdu(app, _pdu("06 80 0C 10 E1"), 1.0)
     check("Test Center 写寄存器生效", app.mb.read(3, 32780, 1) == [4321])
 
-    _t, r, _e = mtc.send_pdu(app, _pdu("2B 0E 01 00"), 1.0)
+    _t, r, _e = mtc.send_pdu(app, _pdu("41 00 00 00 01"), 1.0)
     check("Test Center 不支持的功能码被如实上报",
           len(r) > 8 and (r[7] & 0x80) and r[8] == 1)
 
@@ -699,7 +712,179 @@ if USE_MDI:
         time.sleep(0.05)
     check("线圈脉冲到期恢复", app.mb.read(1, 4100, 1) == [False])
 
-# 2.16 弹窗零报错
+# 2.16 显示格式扩展（AsciiHex / 64 位 × 4 档字节序）
+if USE_MDI:
+    app.mb.connect("127.0.0.1", 502, 1, 3.0)
+    app.fc, app.scale, app.offset, app.unit = 3, 1, 0, ""
+
+    app.fmt = "AsciiHex"
+    check("AsciiHex：可打印两字符", app._format_value([0x4142], 0) == "AB",
+          app._format_value([0x4142], 0))
+    check("AsciiHex：不可打印显示 ·", app._format_value([0x0041], 0) == "·A",
+          app._format_value([0x0041], 0))
+
+    import struct as _st
+
+    def _swap16b(w):
+        return ((w & 0xFF) << 8) | (w >> 8)
+
+    _ws = list(_st.unpack(">4H", _st.pack(">d", 1234.5678)))
+    _cases64 = [("ABCD（大端）", _ws),
+                ("CDAB（字交换）", list(reversed(_ws))),
+                ("BADC（字节交换）", [_swap16b(w) for w in _ws]),
+                ("DCBA（全交换）", [_swap16b(w) for w in reversed(_ws)])]
+    app.fmt = "Double"
+    _ok4 = True
+    for _name, _vv in _cases64:
+        app.word_order = _name
+        if app._format_value(_vv, 0) != "1234.5678":
+            _ok4 = False
+    check("Double 64 位 4 档字节序解析一致", _ok4)
+
+    app.fmt, app.word_order = "UInt32", "ABCD（大端）"
+    check("UInt32 最大值", app._format_value([0xFFFF, 0xFFFF], 0) == "4294967295",
+          app._format_value([0xFFFF, 0xFFFF], 0))
+    check("_row_step UInt32 = 2", app._row_step() == 2)
+
+    app.fmt = "Int64"
+    check("Int64 正数", app._format_value([1, 2, 3, 4], 0) == "281483566841860",
+          app._format_value([1, 2, 3, 4], 0))
+    check("Int64 负数（全 F）", app._format_value([0xFFFF] * 4, 0) == "-1")
+    app.fmt = "UInt64"
+    check("UInt64 最大值（无浮点精度损失）",
+          app._format_value([0xFFFF] * 4, 0) == "18446744073709551615",
+          app._format_value([0xFFFF] * 4, 0))
+
+    app.fmt = "Double"
+    check("_row_step 64 位格式 = 4", app._row_step() == 4)
+    app.fmt = "AsciiHex"
+    check("_row_step AsciiHex = 1", app._row_step() == 1)
+    check("AsciiHex 不参与越限判断", app._alarm_state([0x4142], 0) is None)
+    check("AsciiHex 不参与曲线", app._plot_value([0x4142], 0) is None)
+
+    # 64 位格式下的行数折算：40 个寄存器 → 10 行
+    app.fmt, app.qty, app.max_rows = "Double", 40, 10
+    app.values = list(range(40))
+    app._refresh_grid()
+    _row0 = app.tree.item(app.tree.get_children()[0], "values")
+    check("64 位格式行数折算（40 寄存器 = 10 行）",
+          len(app.tree.get_children()) == 10 and _row0[2] not in ("—", "-"), str(_row0))
+    app.fmt, app.qty, app.max_rows = "Signed", 10, 10
+    app.values = []
+    app.word_order = tmod.ORDER4[0]
+
+# 2.17 功能码 23（读写多个寄存器）/ 43/14（读设备标识）
+if USE_MDI:
+    app.mb.connect("127.0.0.1", 502, 1, 3.0)
+
+    got = app._do_fc23(32790, [111, 222, 333], 32790, 3)
+    check("FC23 写 3 个 + 同帧读回 3 个", got == [111, 222, 333], str(got))
+    check("FC23 写入持久（回读确认）", app.mb.read(3, 32790, 3) == [111, 222, 333])
+
+    got = app._do_fc23(32791, [7], 32790, 1)
+    check("FC23 读地址独立于写地址", got == [111], str(got))
+
+    _bad = False
+    try:
+        app._do_fc23(32790, [1], 32790, 126)
+    except ValueError:
+        _bad = True
+    check("FC23 读数量超限（126）被本地拦下", _bad)
+
+    _bad = False
+    try:
+        app._do_fc23(0, [1], 0, 1)          # 机器人模式：保持寄存器 < 32768 非法
+    except mpl.ModbusError as e:
+        _bad = (e.code == 2)
+    check("FC23 非法地址 → 从站异常码 02", _bad)
+
+    conformity, objs = app._read_device_id(1)
+    check("FC43 基本读取（≥3 个对象含厂商名）", len(objs) >= 3 and 0 in objs,
+          f"{len(objs)} 个，conformity=0x{conformity:02X}")
+    check("FC43 厂商名与从站一致", objs.get(0) == b"Modbus Poll Lite Simulator",
+          str(objs.get(0)))
+    conformity, objs = app._read_device_id(4, 0)
+    check("FC43 指定对象读取（04 码）", list(objs.keys()) == [0], str(list(objs.keys())))
+    _bad = False
+    try:
+        app._read_device_id(4, 0x77)
+    except mpl.ModbusError as e:
+        _bad = (e.code == 2)
+    check("FC43 不存在的对象 → 异常码 02", _bad)
+
+# 2.18 记录选项 / 批量别名 / 批量操作 / 连接工厂
+if USE_MDI:
+    app.mb.connect("127.0.0.1", 502, 1, 3.0)
+    app.fc, app.addr, app.qty = 3, 32768, 10
+
+    # 记录选项：制表符分隔 + 仅变化时记录
+    app.log_opts.update(delim="\t", ms=False, changed_only=True)
+    _csv2 = os.path.join(tempfile.gettempdir(), "mpl_regress2.csv")
+    tmod.filedialog.asksaveasfilename = lambda **k: _csv2
+    mpl.filedialog.asksaveasfilename = lambda **k: _csv2
+    app._toggle_log(True)
+    app._read_once()
+    app._read_once()                        # 数值没变 → 不记
+    app.mb.write_single_register(32770, 555)
+    app._read_once()                        # 数值变了 → 记
+    app._toggle_log(False)
+    _lines = open(_csv2, encoding="utf-8-sig").read().strip().split("\n")
+    check("记录设置：制表符分隔", "\t" in _lines[0], _lines[0][:30])
+    check("记录设置：仅变化时记录（3 次读落 2 行数据）", len(_lines) == 3, f"{len(_lines)} 行")
+    app.log_opts.update(delim=",", ms=False, changed_only=False)
+
+    # 批量别名：{n} / {addr} / {p}
+    app.fc, app.addr, app.qty, app.fmt = 3, 32768, 10, "Signed"
+    n = app._apply_alias_batch("D{addr} 点{n}", 1)
+    check("批量别名：按模板生成", n == 10 and app.alias.get(32768) == "D32768 点1"
+          and app.alias.get(32777) == "D32777 点10", str(app.alias.get(32768)))
+    app._apply_alias_batch("{p}", 1)
+    check("批量别名：{p} 用 PLC 地址口径（32768 + 40001）",
+          app.alias.get(32768) == "72769", app.alias.get(32768))
+    app.alias.clear()
+
+    # 批量操作：全窗口清零 / 统一从站号 / 统一扫描周期
+    _a2 = root.new_area()
+    root.set_active(app)
+    app.mb.tx, app.mb.err = 7, 3
+    _a2.mb.tx = 5
+    root.reset_all_counters()
+    check("批量：清零全部窗口 Tx/Err", app.mb.tx == 0 and _a2.mb.tx == 0)
+    check("批量：统一设置从站号",
+          root._apply_all_unit(9) and app.slave_id == 9 and _a2.slave_id == 9)
+    check("批量：统一设置扫描周期", root._apply_all_scan_rate(250) and app.scan_rate == 250)
+    _save_err2 = tmod.messagebox.showerror
+    tmod.messagebox.showerror = lambda *a, **k: None
+    try:
+        _bad = (root._apply_all_unit(999) is False
+                and root._apply_all_scan_rate(10) is False)
+    finally:
+        tmod.messagebox.showerror = _save_err2
+    check("批量：非法值被拒绝", _bad)
+    root._apply_all_unit(1)
+    root._apply_all_scan_rate(1000)
+    _a2.close()
+
+    # 连接工厂：TCP / UDP（UDP 起专用从站 5062 实测）
+    _udp_p = subprocess.Popen(
+        [sys.executable, "-u", os.path.join(SRC, "modbus_tcp_slave.py"),
+         "--robot", "--port", "5062", "--udp"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    extra_slaves.append(_udp_p)
+    for _ in range(25):
+        time.sleep(0.2)
+        if port_open(5062):
+            break
+    _m1 = app._make_master("TCP", 1, "127.0.0.1", 502, 3000)
+    check("连接工厂：Modbus TCP", len(_m1.read(3, 32768, 1)) == 1)
+    _m1.close()
+    _m2 = app._make_master("UDP", 1, "127.0.0.1", 5062, 1500)
+    check("连接工厂：Modbus UDP 实测读", len(_m2.read(3, 32768, 1)) == 1)
+    _m2.write_single_register(32785, 606)
+    check("连接工厂：Modbus UDP 写回读", _m2.read(3, 32785, 1) == [606])
+    _m2.close()
+
+# 2.19 弹窗零报错
 check("测试期间无错误弹窗", not _errors, str(_errors[:2]) if _errors else "")
 
 if USE_MDI and root is not None:
@@ -724,5 +909,13 @@ if slave_proc:
     except Exception:
         slave_proc.kill()
     print("（测试启动的从站已关闭）")
+for _p in extra_slaves:
+    _p.terminate()
+    try:
+        _p.wait(timeout=3)
+    except Exception:
+        _p.kill()
+if extra_slaves:
+    print("（测试启动的额外从站已关闭）")
 
 sys.exit(1 if FAILED else 0)

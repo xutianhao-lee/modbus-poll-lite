@@ -19,16 +19,16 @@ modbus_poll_lite/
 │   ├── modbus_serial.py            串口 RTU/ASCII + RTU/ASCII over TCP
 │   ├── modbus_testcenter.py        Test Center 手动构造报文
 │   └── modbus_tcp_slave.py         从站模拟器
-├── tests/                          回归测试（217 项）
-│   ├── test_modbus_poll_lite.py    单窗口 56 项 / 多窗口 116 项
-│   └── test_modbus_serial.py       串口协议栈 45 项
+├── tests/                          回归测试（310 项）
+│   ├── test_modbus_poll_lite.py    单窗口 56 项 / 多窗口 151 项
+│   └── test_modbus_serial.py       串口·UDP 协议栈 103 项
 ├── dist/                           打包产物（exe 不纳入版本库，须自行打包）与用户文档
 │   ├── modbus_poll_lite_mdi.exe    主站（免 Python 运行）
 │   ├── modbus_slave.exe            从站模拟器
 │   ├── Modbus工具使用说明.txt
 │   └── 更新说明.txt                 本版功能与修复记录
 ├── docs/
-│   ├── TODO.md                     开发记录（17 批迭代及验证结果）
+│   ├── TODO.md                     开发记录（18 批迭代及验证结果）
 │   └── preview.png                 界面预览（README 展示）
 ├── build/                          PyInstaller 中间产物（可删除）
 ├── build_exe.sh                    打包脚本
@@ -80,8 +80,8 @@ bash build_exe.sh
 ```bash
 cd tests
 PYTHONIOENCODING=utf-8 python test_modbus_poll_lite.py          # 单窗口 56 项
-PYTHONIOENCODING=utf-8 python test_modbus_poll_lite.py --mdi    # 多窗口 116 项
-PYTHONIOENCODING=utf-8 python test_modbus_serial.py             # 串口 45 项
+PYTHONIOENCODING=utf-8 python test_modbus_poll_lite.py --mdi    # 多窗口 151 项
+PYTHONIOENCODING=utf-8 python test_modbus_serial.py             # 串口·UDP 103 项
 ```
 
 从站未运行时，测试会**自动启动临时从站并在测试结束后关闭**，因此可独立执行，
@@ -153,19 +153,25 @@ dist/modbus_poll_lite_mdi.exe --selftest
 
 ## 与 Modbus Poll 的功能对比
 
-**已实现**：多窗口、串口 RTU/ASCII、RTU/ASCII over TCP、实时曲线、
-Test Center、掩码写 (22)、脉冲写（点动）、设备扫描、字节序 4 档、暂停轮询、
-RTS toggle、地址扫描、缩放、条件着色、数据记录、报文监视、配置保存
+> 基准：Modbus Poll **13.2.1.2558**（2026-10-13 用 REA 逆向核实的官方功能表，
+> 分析存档 `_archive/rea-20261013/mbpoll/`）
 
-**尚未实现**：
-- UDP 系列（3 种）
-- 显示格式 6 种 vs 28 种（缺 64 位浮点、字符串、日期时间）
-- 功能码 23 / 43 的原生支持（可通过 Test Center 手动构造）
-- 记录直接写 Excel、OLE 自动化、打印
+**已实现**：多窗口、8 种连接方式（Modbus TCP / UDP、串口 RTU·ASCII、
+RTU·ASCII over TCP·UDP）、实时曲线（双游标 + 导出 CSV / PNG）、Test Center、
+掩码写 (22)、脉冲写（点动）、**FC23 读写多个寄存器**、**FC43/14 读设备标识**、
+设备扫描、地址扫描、批量别名、批量操作（全窗口清零 / 统一从站号 / 统一扫描周期）、
+字节序 4 档、**显示格式 11 种**（含 UInt32 / 64 位 Int64·UInt64·Double / ASCII 显示）、
+暂停轮询、RTS toggle、缩放、条件着色、记录设置（分隔符 / 毫秒 / 仅变化）、
+报文监视、配置保存
 
-**已知局限**：串口的**真实 COM 口收发尚未经硬件验证**。
-帧格式、CRC/LRC、帧分割及主站逻辑均已测试，尚未覆盖 pyserial
-驱动程序层的实际串口读写。
+**尚未实现**（有意取舍）：
+- 打印 / 打印预览、OLE 自动化、记录直接写 Excel
+- Modbus/TCP Security (TLS)、Enron/Daniel 模式、08/11/17 诊断类对话框
+- 数值名表 / 位名表 / 字符串视图 / 单元格字体与配色细节
+- 工作区（多窗口布局整体保存）
+
+**已知局限**：串口的**真实 COM 口收发尚未经硬件验证**（帧格式、CRC/LRC、
+帧分割及主站逻辑均已测试）；从站模拟器暂不支持串口。
 
 ---
 

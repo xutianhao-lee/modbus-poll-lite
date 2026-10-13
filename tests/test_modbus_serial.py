@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-test_modbus_serial.py —— 串口 / RTU / ASCII 协议栈回归测试
+test_modbus_serial.py —— 串口 / RTU / ASCII / UDP 协议栈回归测试
 
 没有串口硬件也能跑：
-    帧格式层（CRC、LRC、分帧、异常帧）通过 "RTU/ASCII over TCP" 做**端到端**验证，
+    帧格式层（CRC、LRC、分帧、异常帧）通过 "RTU/ASCII over TCP" 和
+    "RTU/ASCII over UDP" 做**端到端**验证，
     只留 pyserial 的 OS 读写那一薄层未覆盖（会单独验证它的接口与报错提示）。
+    Modbus UDP（MBAP over UDP）单独用 UdpTransport 端到端验证。
 
 跑法：cd tests && PYTHONIOENCODING=utf-8 python test_modbus_serial.py
 退出码：0 = 全过，1 = 有失败，2 = 环境起不来
@@ -54,11 +56,12 @@ def port_open(port):
         s.close()
 
 
-def start_slave(port, frame):
-    p = subprocess.Popen(
-        [sys.executable, "-u", os.path.join(SRC, "modbus_tcp_slave.py"),
-         "--robot", "--frame", frame, "--port", str(port)],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def start_slave(port, frame, udp=False):
+    cmd = [sys.executable, "-u", os.path.join(SRC, "modbus_tcp_slave.py"),
+           "--robot", "--frame", frame, "--port", str(port)]
+    if udp:
+        cmd.append("--udp")
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(30):
         time.sleep(0.3)
         if port_open(port):
@@ -129,6 +132,10 @@ try:
           all(ms.RtuCodec.frame_length(bytes([1, fc])) is None for fc in (1, 2, 3, 4)))
     check("RTU 长度推算 异常帧定长 5",
           ms.RtuCodec.frame_length(bytes([1, 0x83])) == 5)
+    check("RTU 长度推算 23 应答同读响应（看 byte_count）",
+          ms.RtuCodec.frame_length(bytes([1, 23])) is None)
+    check("RTU 长度推算 43/14 变长（专门逐对象读）",
+          ms.RtuCodec.frame_length(bytes([1, 0x2B])) is None)
 
     # ==================================================== 3. 端到端
     def protocol_suite(master, label):
@@ -176,6 +183,26 @@ try:
                 q_ok = (e.code == 3)
             check(f"{label}：数量 130 -> 异常码 03", q_ok)
 
+            # 功能码 23：写 2 + 同帧读回 2（覆盖 FC23 的分帧路径）
+            r = master.request(struct.pack(">BHHHHB", 23, 32790, 2, 32790, 2, 4)
+                               + struct.pack(">HH", 4242, 2424))
+            check(f"{label}：FC23 写 2 + 读回 2",
+                  r[0] == 23 and r[1] == 4 and struct.unpack(">HH", r[2:6]) == (4242, 2424),
+                  r.hex(" ").upper())
+
+            # 功能码 22：掩码写（响应回显，定长 10 字节帧——之前没在 RTU 下测过）
+            master.write_single_register(32780, 0xFF00)
+            r = master.request(struct.pack(">BHHH", 22, 32780, 0xFF0F, 0x00F0))
+            check(f"{label}：FC22 掩码写回显",
+                  r == struct.pack(">BHHH", 22, 32780, 0xFF0F, 0x00F0)
+                  and master.read(3, 32780, 1) == [0xFFF0], r.hex(" ").upper())
+
+            # 功能码 43/14：基本读取（覆盖变长应答的分帧路径）
+            r = master.request(struct.pack(">BBBB", 0x2B, 0x0E, 1, 0))
+            check(f"{label}：FC43/14 基本读取可解析",
+                  r[0] == 0x2B and r[1] == 0x0E and len(r) > 7 and r[6] >= 3,
+                  r.hex(" ").upper()[:60])
+
             # 广播：立即返回
             master.unit = 0
             t0 = time.time()
@@ -205,6 +232,58 @@ try:
     asc.connect_tcp("127.0.0.1", 5032, timeout=2.0)
     check("ASCII over TCP 连接建立", asc.connected, asc.peer)
     protocol_suite(asc, "ASCII over TCP")
+
+    # ==================================================== 3b. UdpTransport
+    section("【3b】UdpTransport 传输层（本机 UDP 回显套接字）")
+    echo = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    echo.bind(("127.0.0.1", 0))
+    _ea = echo.getsockname()
+    t = ms.UdpTransport(_ea[0], _ea[1], 1.0)
+    check("UdpTransport 构造", True, t.description)
+    t.sendall(b"\x01\x02\x03")
+    _d, _peer = echo.recvfrom(64)
+    check("UdpTransport 发送数据报", _d == b"\x01\x02\x03", _d.hex(" ").upper())
+    echo.sendto(_d + b"\xAA", _peer)
+    _back = t.read_exact(4)
+    check("UdpTransport read_exact 缓冲累积", _back == b"\x01\x02\x03\xAA",
+          _back.hex(" ").upper())
+    t.sendall(b"AB\r\n")
+    _d, _peer = echo.recvfrom(64)
+    echo.sendto(b"AB\r\n", _peer)
+    _got = t.read_until(b"\r\n", limit=16)
+    check("UdpTransport read_until 按终止符收", _got == b"AB\r\n", str(_got))
+    t.close()
+    echo.close()
+
+    # ==================================================== 3c. UDP 系列
+    section("【3c】UDP 系列 —— Modbus UDP / RTU over UDP / ASCII over UDP")
+
+    p_udp = start_slave(5041, "mbap", udp=True)
+    slaves.append(p_udp)
+    udp = ms.ModbusUdpMaster()
+    udp.connect("127.0.0.1", 5041, 1, timeout=2.0)
+    check("Modbus UDP 连接建立", udp.connected, udp.peer)
+    protocol_suite(udp, "Modbus UDP")
+
+    p_rtu_udp = start_slave(5042, "rtu", udp=True)
+    slaves.append(p_rtu_udp)
+    rtu_udp = ms.ModbusSerialMaster("RTU")
+    rtu_udp.connect_transport(ms.UdpTransport("127.0.0.1", 5042, 2.0))
+    check("RTU over UDP 连接建立", rtu_udp.connected, rtu_udp.peer)
+    protocol_suite(rtu_udp, "RTU over UDP")
+
+    p_asc_udp = start_slave(5043, "ascii", udp=True)
+    slaves.append(p_asc_udp)
+    asc_udp = ms.ModbusSerialMaster("ASCII")
+    asc_udp.connect_transport(ms.UdpTransport("127.0.0.1", 5043, 2.0))
+    check("ASCII over UDP 连接建立", asc_udp.connected, asc_udp.peer)
+    protocol_suite(asc_udp, "ASCII over UDP")
+
+    _need = ["connect", "close", "request", "read", "write_single_register",
+             "write_single_coil", "write_multiple_registers", "write_multiple_coils"]
+    _missing = [n for n in _need if not hasattr(ms.ModbusUdpMaster(), n)]
+    check("UDP 主站与 TCP 主站接口一致", not _missing,
+          f"缺 {_missing}" if _missing else "")
 
     # ==================================================== 4. 串口层
     section("【4】pyserial 传输层（无硬件，只验接口与报错）")

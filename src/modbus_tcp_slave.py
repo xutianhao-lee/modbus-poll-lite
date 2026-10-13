@@ -7,7 +7,7 @@ modbus_tcp_slave.py —— 零依赖 Modbus TCP 从站模拟器（练手 / 自�
 
 支持功能码：01 读线圈 / 02 读离散输入 / 03 读保持寄存器 / 04 读输入寄存器
             05 写单线圈 / 06 写单寄存器 / 15 写多线圈 / 16 写多寄存器
-            22 掩码写寄存器
+            22 掩码写寄存器 / 23 读写多个寄存器 / 43/14 读设备标识
 不支持的功能码回异常码 01。
 
 两种模式：
@@ -51,7 +51,7 @@ LOCK = threading.Lock()
 
 FC_NAME = {1: "读线圈", 2: "读离散输入", 3: "读保持寄存器", 4: "读输入寄存器",
            5: "写单线圈", 6: "写单寄存器", 15: "写多线圈", 16: "写多寄存器",
-           22: "掩码写寄存器"}
+           22: "掩码写寄存器", 23: "读写多个寄存器", 43: "读设备标识"}
 EXC_NAME = {1: "非法功能码", 2: "非法数据地址", 3: "非法数据值", 4: "从站设备故障"}
 
 
@@ -95,6 +95,18 @@ def updater():
             HR[6], HR[7] = _f32_regs(temp)
             CO[0] = (n % 10) < 5             # 运行标志：1 秒闪一次
             CO[1] = False
+
+
+# 43/14 读设备标识：对象 ID -> 值（bytes）
+DEVICE_ID = {
+    0x00: b"Modbus Poll Lite Simulator",                       # 厂商名
+    0x01: b"MPL-SIM",                                          # 产品代码
+    0x02: b"V1.0",                                             # 主次版本
+    0x03: b"https://github.com/xutianhao-lee/modbus-poll-lite",  # 厂商 URL
+    0x04: b"Modbus Poll Lite Slave",                           # 产品名称
+    0x05: b"MPL-SIM-01",                                       # 型号名称
+    0x06: b"Simulator",                                        # 用户应用名
+}
 
 
 def crc16(data):
@@ -231,6 +243,51 @@ def handle_pdu(pdu, tag):
               f" → {old} → {HR[idx]}")
         return pdu
 
+    if fc == 23:
+        # 请求：读地址(2) 读数量(2) 写地址(2) 写数量(2) 写字节数(1) 写数据(N)
+        if len(pdu) < 10:
+            return exception(fc, 3)
+        ra, rq, wa, wq, nb = struct.unpack(">HHHHB", pdu[1:10])
+        if not 1 <= rq <= 125 or not 1 <= wq <= 121 or nb != wq * 2 or len(pdu) < 10 + nb:
+            print(f"  {tag} FC23 参数非法（读{rq} 写{wq} 字节数{nb}）→ 异常码 03")
+            return exception(fc, 3)
+        with LOCK:
+            widx = to_index(3, wa, wq)
+            if widx is None:
+                print(f"  {tag} FC23 写地址{wa} → 异常码 02（非法数据地址）")
+                return exception(fc, 2)
+            ridx = to_index(3, ra, rq)
+            if ridx is None:
+                print(f"  {tag} FC23 读地址{ra} → 异常码 02（非法数据地址）")
+                return exception(fc, 2)
+            for i in range(wq):                  # 规范：先执行写，再执行读
+                HR[widx + i] = struct.unpack(">H", pdu[10 + i * 2:12 + i * 2])[0]
+            data = b"".join(struct.pack(">H", HR[ridx + i]) for i in range(rq))
+        print(f"  {tag} {FC_NAME[fc]} 写 地址{wa}×{wq}，读 地址{ra}×{rq}")
+        return bytes([fc, len(data)]) + data
+
+    if fc == 0x2B:
+        # 43/14 读设备标识：MEI(0x0E) 读取码(1~4) 对象ID
+        if len(pdu) < 4 or pdu[1] != 0x0E:
+            return exception(fc, 1)              # 仅支持 MEI = 0x0E
+        code, obj = pdu[2], pdu[3]
+        if code not in (1, 2, 3, 4):
+            print(f"  {tag} 读设备标识 读取码 {code} 非法 → 异常码 03")
+            return exception(fc, 3)
+        if code == 4:                            # 指定对象
+            if obj not in DEVICE_ID:
+                print(f"  {tag} 读设备标识 对象 0x{obj:02X} 不存在 → 异常码 02")
+                return exception(fc, 2)
+            ids = [obj]
+        else:                                    # 基本/常规/扩展：从 obj 起返回
+            ids = [i for i in sorted(DEVICE_ID) if i >= obj]
+            if not ids:
+                return exception(fc, 2)
+        body = b"".join(bytes([i, len(DEVICE_ID[i])]) + DEVICE_ID[i] for i in ids)
+        print(f"  {tag} {FC_NAME[fc]} 读取码{code:02d} 对象{obj} → {len(ids)} 个对象")
+        # conformity 0x83 = 支持 基本+常规+单个访问；moreFollows=0，单页返回
+        return struct.pack(">BBBBBBB", 0x2B, 0x0E, code, 0x83, 0x00, 0x00, len(ids)) + body
+
     print(f"  {tag} 功能码 {fc} → 异常码 01（本模拟器不支持）")
     return exception(fc, 1)
 
@@ -256,17 +313,35 @@ def read_rtu_request(conn):
     ⚠ 请求和响应的分帧规则**不一样**，别混用：
         请求 01/02/03/04/05/06  → 定长 8 字节（unit+fc+4 数据+crc）
         请求 15/16              → 9 + byte_count（多了 1 字节字节数）
-        响应 01~04              → 第 3 字节才是 byte_count
+        请求 22                 → 定长 10 字节（fc+addr+and+or+crc）
+        请求 23                 → 13 + byte_count（读写各 4 字节 + 1 字节数）
+        请求 43/14              → 定长 7 字节（fc+mei+code+obj+crc）
+        响应 01~04 / 23         → 第 3 字节才是 byte_count
+        响应 43/14              → 变长（按对象个数累加）
     """
     head = recv_exact(conn, 2)
     if head is None:
         return None
-    if head[1] in (15, 16):
+    if head[1] == 23:
+        mid = recv_exact(conn, 8)          # 读地址(2)+读数量(2)+写地址(2)+写数量(2)
+        if mid is None:
+            return None
+        head += mid
+        bc = recv_exact(conn, 1)
+        if bc is None:
+            return None
+        head += bc
+        need = 11 + bc[0] + 2
+    elif head[1] in (15, 16):
         mid = recv_exact(conn, 5)          # 起始地址(2) + 数量(2) + 字节数(1)
         if mid is None:
             return None
         head += mid
         need = 7 + mid[4] + 2
+    elif head[1] == 22:
+        need = 10                          # 掩码写：定长（fc+addr+and+or = 7）
+    elif head[1] == 0x2B:
+        need = 7                           # 读设备标识：定长（fc+mei+code+obj = 4）
     else:
         need = 8
     rest = recv_exact(conn, need - len(head))
@@ -330,6 +405,75 @@ def take_frame(conn, mode, tag):
     return payload[0], payload[1:], 0
 
 
+def parse_udp_frame(data, mode):
+    """UDP 数据报 → (uid, pdu, tid)；坏帧返回 None。
+
+    一个数据报 = 一整帧（mbap / rtu / ascii 三种帧格式都支持）。
+    """
+    if mode == "mbap":
+        if len(data) < 8:
+            return None
+        tid, _pid, length, uid = struct.unpack(">HHHB", data[:7])
+        body = data[7:7 + max(0, length - 1)]
+        if not body:
+            return None
+        return uid, body, tid
+    if mode == "rtu":
+        if len(data) < 4:
+            return None
+        body, got = data[:-2], data[-2:]
+        want = crc16(body)
+        if bytes([want & 0xFF, (want >> 8) & 0xFF]) != got:
+            return None
+        return body[0], body[1:], 0
+    # ascii
+    if not (data.startswith(b":") and data.endswith(b"\r\n")):
+        return None
+    try:
+        raw = bytes.fromhex(data[1:-2].decode("ascii", "replace").strip())
+    except ValueError:
+        return None
+    if len(raw) < 2:
+        return None
+    payload, got = raw[:-1], raw[-1]
+    if lrc(payload) != got:
+        return None
+    return payload[0], payload[1:], 0
+
+
+def serve_udp(sock, unit_id, any_unit, mode):
+    """UDP 服务循环：Modbus UDP（mbap）/ RTU over UDP / ASCII over UDP"""
+    print(f"++ UDP 监听就绪（帧格式 {mode.upper()}，端口 {sock.getsockname()[1]}）")
+    while True:
+        try:
+            data, peer = sock.recvfrom(4096)
+        except OSError:
+            return
+        tag = f"[UDP {peer[0]}:{peer[1]}]"
+        got = parse_udp_frame(data, mode)
+        if got is None:
+            print(f"  {tag} 收到无法解析的数据报（{len(data)} 字节），已丢弃")
+            continue
+        uid, pdu, tid = got
+        if uid == 0:
+            handle_pdu(pdu, tag)
+            print(f"  {tag} 广播帧（从站号 0）→ 已执行，不应答")
+            continue
+        if not any_unit and uid != unit_id:
+            continue
+        resp = handle_pdu(pdu, tag)
+        if mode == "mbap":
+            out = struct.pack(">HHHB", tid, 0, len(resp) + 1, uid) + resp
+        elif mode == "rtu":
+            out = bytes([uid]) + resp
+            c = crc16(out)
+            out += bytes([c & 0xFF, (c >> 8) & 0xFF])
+        else:
+            raw = bytes([uid]) + resp
+            out = b":" + (raw + bytes([lrc(raw)])).hex().upper().encode() + b"\r\n"
+        sock.sendto(out, peer)
+
+
 def serve_conn(conn, peer, unit_id, any_unit, mode="mbap"):
     tag = f"[{peer[0]}:{peer[1]}]"
     print(f"++ 主站接入 {tag}（帧格式 {mode.upper()}）")
@@ -383,6 +527,8 @@ def main():
                     help="帧格式：mbap = 标准 Modbus TCP（默认）；"
                          "rtu / ascii = 去掉 MBAP 头，配 TCP 端口用即 RTU/ASCII over TCP，"
                          "用于在没有串口硬件时验证串口协议栈")
+    ap.add_argument("--udp", action="store_true",
+                    help="同时监听 UDP（配 --frame 即 Modbus UDP / RTU over UDP / ASCII over UDP）")
     args = ap.parse_args()
     ROBOT = args.robot
 
@@ -398,6 +544,18 @@ def main():
         print("换个端口试试： --port 5020（Modbus Poll 里 Port 也要跟着改）")
         return 1
     srv.listen(8)
+
+    if args.udp:
+        us = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        us.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            us.bind(("0.0.0.0", args.port))
+        except OSError as e:
+            print(f"绑定 UDP 端口 {args.port} 失败：{e}")
+            return 1
+        threading.Thread(target=serve_udp,
+                         args=(us, args.unit, args.any_unit, args.frame),
+                         daemon=True).start()
 
     print("=" * 66)
     print(f"Modbus TCP 从站模拟器已启动   模式：{'机器人地址表' if ROBOT else '通用练手'}")
@@ -417,6 +575,8 @@ def main():
         print("  → 想练写命令：FC05 写线圈地址 4096")
         print("-" * 66)
     print("  Ctrl+C 退出")
+    if args.udp:
+        print(f"  同时监听  UDP 0.0.0.0:{args.port}（Modbus UDP / RTU·ASCII over UDP）")
     print("=" * 66)
 
     try:

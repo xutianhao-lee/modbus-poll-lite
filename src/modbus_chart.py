@@ -14,9 +14,10 @@ modbus_chart.py —— 实时曲线窗口（Canvas 自绘，无第三方依赖�
 """
 
 import collections
+import os
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog, messagebox
 
 # 游标说明：
 #   游标**固定在屏幕上**（存的是屏幕比例 0~1，不是时间戳）。
@@ -117,6 +118,8 @@ class ChartWindow(tk.Toplevel):
         self.btn_pause = ttk.Button(bar, text="暂停", command=self._toggle_pause)
         self.btn_pause.pack(side="left", padx=(12, 4))
         ttk.Button(bar, text="清空", command=self._clear).pack(side="left")
+        ttk.Button(bar, text="导出 CSV", command=self._export_csv).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="导出 PNG", command=self._export_png).pack(side="left", padx=(4, 0))
         ttk.Button(bar, text="全选", width=6,
                    command=lambda: self._show_all(True)).pack(side="left", padx=(10, 2))
         ttk.Button(bar, text="全不选", width=7,
@@ -270,6 +273,87 @@ class ChartWindow(tk.Toplevel):
         self.color_map.clear()
         self.hidden.clear()
         self.last_no = -1
+
+    # ---------------------------------------------------------------- 导出
+    def _export_csv_to(self, path):
+        """把当前曲线数据导出为 CSV（各通道按采集时刻对齐写一行）。
+        返回写入的路径。格式：时间(s), 时刻, 各通道值"""
+        rows = {}                                  # t -> {addr: v}
+        for addr, dq in self.history.items():
+            for t, v in dq:
+                rows.setdefault(t, {})[addr] = v
+        addrs = sorted(self.history.keys())
+        t0 = min(rows) if rows else 0.0
+        header = (["时间(s)", "时刻"]
+                  + [(self.area.alias.get(a) or str(a)) for a in addrs])
+        with open(path, "w", encoding="utf-8-sig", newline="") as fh:
+            fh.write(",".join(str(h) for h in header) + "\n")
+            for t in sorted(rows):
+                cells = [f"{t - t0:.3f}",
+                         time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))]
+                for a in addrs:
+                    v = rows[t].get(a)
+                    cells.append("" if v is None else f"{v:.6g}")
+                fh.write(",".join(cells) + "\n")
+        return path
+
+    def _export_csv(self):
+        if not self.history:
+            messagebox.showinfo("没有数据", "曲线还没有数据可导出。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出曲线数据 CSV", defaultextension=".csv",
+            initialfile=time.strftime(f"chart_a{self.area.index}_%Y%m%d_%H%M%S.csv"),
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            got = self._export_csv_to(path)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            return
+        messagebox.showinfo("已导出", got)
+
+    def _export_png_to(self, path):
+        """把曲线画布导出为图片：装了 Pillow 直接导 PNG；
+        没装则回退 PostScript（.ps，可用 WPS / Inkscape 转 PNG）。
+        返回实际写入的路径。"""
+        try:
+            from PIL import ImageGrab                # 可选依赖
+            self.update_idletasks()
+            x = self.canvas.winfo_rootx()
+            y = self.canvas.winfo_rooty()
+            w = self.canvas.winfo_width()
+            h = self.canvas.winfo_height()
+            ImageGrab.grab(bbox=(x, y, x + w, y + h)).save(path)
+            return path
+        except Exception:
+            ps = os.path.splitext(path)[0] + ".ps"
+            self.canvas.postscript(file=ps, colormode="color")
+            return ps
+
+    def _export_png(self):
+        if not self.history:
+            messagebox.showinfo("没有数据", "曲线还没有数据可导出。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出曲线图片", defaultextension=".png",
+            initialfile=time.strftime(f"chart_a{self.area.index}_%Y%m%d_%H%M%S.png"),
+            filetypes=[("PNG 图片", "*.png"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            got = self._export_png_to(path)
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+            return
+        if got == path:
+            messagebox.showinfo("已导出", got)
+        else:
+            messagebox.showinfo(
+                "已导出（PostScript 格式）",
+                f"未安装 Pillow，已改存 PostScript：\n{got}\n\n"
+                f"装 Pillow 后可直接导 PNG：\n    pip install pillow")
 
     def _prune(self):
         t0 = time.time() - self.window_sec

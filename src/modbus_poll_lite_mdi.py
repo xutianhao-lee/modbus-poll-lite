@@ -79,6 +79,23 @@ def _swap16(v):
     return ((v & 0xFF) << 8) | (v >> 8)
 
 
+# 显示格式（对齐 Modbus Poll 13 的格式表）
+#   Signed/Unsigned/Hex/Binary/AsciiHex  → 单寄存器（16 位）
+#   Float / Long                         → 32 位（占 2 个寄存器）
+#   Int64 / UInt64 / Double              → 64 位（占 4 个寄存器）
+# 后两档受「多寄存器字节序」控制（ABCD 大端 / CDAB 字交换 / BADC 字节交换 / DCBA 全交换）
+FORMATS_EXT = ["Signed", "Unsigned", "Hex", "Binary", "AsciiHex",
+               "Float", "Long", "UInt32", "Int64", "UInt64", "Double"]
+STEP2_FORMATS = ("Float", "Long", "UInt32")
+STEP4_FORMATS = ("Int64", "UInt64", "Double")
+
+# 43/14 标准对象名（0x80+ 为厂商私有）
+DEV_ID_NAMES = {0: "厂商名 VendorName", 1: "产品代码 ProductCode",
+                2: "主次版本 MajorMinorRevision", 3: "厂商 URL VendorURL",
+                4: "产品名称 ProductName", 5: "型号名称 ModelName",
+                6: "用户应用名 UserApplicationName"}
+
+
 # ==================================================================== 数据区
 
 class DataArea(tk.Toplevel):
@@ -127,6 +144,8 @@ class DataArea(tk.Toplevel):
         self.log_fh = None
         self.log_lock = threading.Lock()
         self.log_path = ""
+        self.log_opts = {"delim": ",", "ms": False, "changed_only": False}
+        self._last_log_vals = None
         self.last_ip = "127.0.0.1"
         self.last_port = 502
         self.last_timeout = 1000
@@ -212,6 +231,38 @@ class DataArea(tk.Toplevel):
         self.lbl_hint.pack(fill="x")
 
     # ------------------------------------------------------------ 连接对话框
+    def _make_master(self, conn_type, unit, ip, port, timeout_ms, serial=None):
+        """按连接类型构造并连接主站（对话框与测试共用，便于单测各传输）。
+
+        conn_type: TCP / UDP / RTU / ASCII / RTU_TCP / ASCII_TCP / RTU_UDP / ASCII_UDP
+        serial:    仅串口类型需要 {port,baud,bytesize,parity,stopbits,rts,timeout}
+        """
+        timeout = timeout_ms / 1000.0
+        if conn_type == "TCP":
+            m = core.ModbusMaster()
+            m.unit = unit
+            m.connect(ip, port, unit, timeout)
+        elif conn_type == "UDP":
+            m = ms.ModbusUdpMaster()
+            m.connect(ip, port, unit, timeout)
+        elif conn_type in ("RTU", "ASCII"):
+            if not serial or not serial.get("port"):
+                raise ValueError("请选择串口（点「刷新」重新枚举）")
+            m = ms.ModbusSerialMaster(mode=conn_type)
+            m.unit = unit
+            m.connect(serial["port"], baud=serial["baud"], bytesize=serial["bytesize"],
+                      parity=serial["parity"], stopbits=serial["stopbits"],
+                      timeout=serial["timeout"], rts_toggle=serial["rts"])
+        elif conn_type in ("RTU_TCP", "ASCII_TCP"):
+            m = ms.ModbusSerialMaster(mode=conn_type.split("_")[0])
+            m.unit = unit
+            m.connect_tcp(ip, port, timeout)
+        else:                                      # RTU_UDP / ASCII_UDP
+            m = ms.ModbusSerialMaster(mode=conn_type.split("_")[0])
+            m.unit = unit
+            m.connect_transport(ms.UdpTransport(ip, port, timeout))
+        return m
+
     def dlg_connect(self):
         top = tk.Toplevel(self)
         top.title(f"Connection Setup —— 数据区 {self.index}")
@@ -219,14 +270,32 @@ class DataArea(tk.Toplevel):
         top.grab_set()
         top.resizable(False, False)
 
-        v_type = tk.StringVar(value=self.last_type)
+        CONN_TYPES = [
+            ("Modbus TCP（标准网口）", "TCP"),
+            ("Modbus UDP（MBAP over UDP）", "UDP"),
+            ("串口 RTU", "RTU"),
+            ("串口 ASCII", "ASCII"),
+            ("RTU over TCP", "RTU_TCP"),
+            ("ASCII over TCP", "ASCII_TCP"),
+            ("RTU over UDP", "RTU_UDP"),
+            ("ASCII over UDP", "ASCII_UDP"),
+        ]
+        v_type = tk.StringVar(value=next(
+            (lab for lab, val in CONN_TYPES if val == self.last_type),
+            CONN_TYPES[0][0]))
+
+        def cur_val():
+            for lab, val in CONN_TYPES:
+                if lab == v_type.get():
+                    return val
+            return "TCP"
+
         tf = ttk.LabelFrame(top, text="Connection（连接方式）", padding=10)
         tf.pack(fill="x", padx=12, pady=(12, 6))
-        for txt, val in (("TCP/IP（Modbus TCP）", "TCP"),
-                         ("串口 RTU", "RTU"),
-                         ("串口 ASCII", "ASCII")):
-            ttk.Radiobutton(tf, text=txt, variable=v_type,
-                            value=val).pack(side="left", padx=(0, 16))
+        ttk.Combobox(tf, textvariable=v_type, state="readonly", width=32,
+                     values=[lab for lab, _ in CONN_TYPES]).pack(side="left")
+        ttk.Label(tf, text="（over TCP/UDP 走网线、帧格式按 RTU/ASCII）",
+                  foreground="#666").pack(side="left", padx=(8, 0))
 
         vf = ttk.Frame(top)
         vf.pack(fill="x", padx=14)
@@ -307,9 +376,9 @@ class DataArea(tk.Toplevel):
                 set_state(c, on)
 
         def sync(*_):
-            t = v_type.get()
-            set_state(tcpf, t == "TCP")
-            set_state(serf, t != "TCP")
+            t = cur_val()
+            set_state(tcpf, t not in ("RTU", "ASCII"))
+            set_state(serf, t in ("RTU", "ASCII"))
 
         v_type.trace_add("write", sync)
         sync()
@@ -319,31 +388,28 @@ class DataArea(tk.Toplevel):
                 unit = int(v_unit.get(), 0)
                 if not 0 <= unit <= 255:
                     raise ValueError(f"从站号 Unit ID 超出范围：0 ~ 255，你填的是 {unit}")
-                t = v_type.get()
-                if t == "TCP":
-                    self.last_ip = v_ip.get().strip()
-                    self.last_port = int(v_port.get())
-                    self.last_timeout = int(v_to.get())
-                    newmb = core.ModbusMaster()
-                    newmb.unit = unit
-                    newmb.connect(self.last_ip, self.last_port, unit,
-                                  self.last_timeout / 1000.0)
-                else:
-                    port = v_sport.get().strip()
-                    if not port:
+                t = cur_val()
+                ip = v_ip.get().strip()
+                port = int(v_port.get())
+                if not 1 <= port <= 65535:
+                    raise ValueError("端口超出范围（1 ~ 65535）")
+                timeout_ms = int(v_to.get())
+                if timeout_ms < 100:
+                    raise ValueError("响应超时不要小于 100 ms")
+                serial_cfg = None
+                if t in ("RTU", "ASCII"):
+                    sport = v_sport.get().strip()
+                    if not sport:
                         raise ValueError("请选择串口（点「刷新」重新枚举）")
                     par = {lb: c for lb, c in ms.PARITY_CHOICES}.get(v_par.get(), "N")
                     stop = {lb: v for lb, v in ms.STOP_CHOICES}.get(v_stop.get(), 1)
-                    timeout = float(v_sto.get() or 1.0)
-                    self.last_serial = {"port": port, "baud": v_baud.get(),
-                                        "bytesize": int(v_bytes.get()), "parity": par,
-                                        "stopbits": int(stop), "rts": v_rts.get(),
-                                        "timeout": timeout}
-                    newmb = ms.ModbusSerialMaster(mode=t)
-                    newmb.unit = unit
-                    newmb.connect(port, baud=v_baud.get(), bytesize=int(v_bytes.get()),
-                                  parity=par, stopbits=int(stop), timeout=timeout,
-                                  rts_toggle=v_rts.get())
+                    serial_cfg = {"port": sport, "baud": v_baud.get(),
+                                  "bytesize": int(v_bytes.get()), "parity": par,
+                                  "stopbits": int(stop), "rts": v_rts.get(),
+                                  "timeout": float(v_sto.get() or 1.0)}
+                    self.last_serial = serial_cfg
+                self.last_ip, self.last_port, self.last_timeout = ip, port, timeout_ms
+                newmb = self._make_master(t, unit, ip, port, timeout_ms, serial_cfg)
                 newmb.on_traffic = self._traffic_cb
                 newmb.traffic = self.mb.traffic          # 沿用报文历史
                 old = self.mb
@@ -404,8 +470,8 @@ class DataArea(tk.Toplevel):
         row(3, "Quantity（数量）", ttk.Entry(f, textvariable=v_qty, width=12))
         row(4, "Scan Rate（扫描周期 ms）", ttk.Entry(f, textvariable=v_rate, width=12))
         row(5, "显示格式", ttk.Combobox(f, textvariable=v_fmt, state="readonly",
-                                     width=14, values=core.FORMATS))
-        row(6, "32 位字节序", ttk.Combobox(f, textvariable=v_ord, state="readonly",
+                                     width=14, values=FORMATS_EXT))
+        row(6, "多寄存器字节序", ttk.Combobox(f, textvariable=v_ord, state="readonly",
                                         width=18, values=ORDER4))
 
         ttk.Label(f, text="缩放").grid(row=7, column=0, sticky="w", pady=4)
@@ -438,7 +504,9 @@ class DataArea(tk.Toplevel):
         ttk.Label(f, text="※ 地址一律填协议地址（从 0 起）。手册里的 40001 在这里就是 0。\n"
                           "※ 数字栏均支持十六进制（0x 前缀）输入，如 0x80 = 128。\n"
                           "※ 03 保持寄存器上限 125 个，01/02 线圈上限 2000 个。\n"
-                          "※ 缩放与条件着色只对 Signed / Unsigned / Float 生效。",
+                          "※ Float/Long/UInt32 占 2 个寄存器、Int64/UInt64/Double 占 4 个，\n"
+                          "   显示行数按寄存器数自动折算；字节序对它们生效。\n"
+                          "※ 缩放与条件着色对数值格式生效（Hex/Binary/AsciiHex 按原始值显示）。",
                   foreground="#666", justify="left").grid(row=11, column=0, columnspan=2,
                                                           sticky="w", pady=(10, 0))
 
@@ -494,7 +562,14 @@ class DataArea(tk.Toplevel):
 
     # ------------------------------------------------------------ 写入
     def _row_step(self):
-        return 2 if (self.fc not in core.BIT_FUNCS and self.fmt in ("Float", "Long")) else 1
+        """一行占几个寄存器：单寄存器格式 1、32 位格式 2、64 位格式 4"""
+        if self.fc in core.BIT_FUNCS:
+            return 1
+        if self.fmt in STEP4_FORMATS:
+            return 4
+        if self.fmt in STEP2_FORMATS:
+            return 2
+        return 1
 
     def _write_dialog(self, fc):
         sel = self.tree.selection()
@@ -716,6 +791,244 @@ class DataArea(tk.Toplevel):
         e_val.bind("<Return>", ok)
         self.wait_window(top)
 
+    # ------------------------------------------------------------ FC23 读写多个寄存器
+    def _do_fc23(self, w_addr, w_vals, r_addr, r_qty):
+        """23 读写多个寄存器：同一事务里先写后读（规范语义）。
+        成功返回读回的寄存器列表；异常抛 ModbusError，通讯故障抛其它异常。"""
+        if not 1 <= r_qty <= 125:
+            raise ValueError(f"Read Quantity（读数量）范围 1 ~ 125，你填的是 {r_qty}")
+        if not 1 <= len(w_vals) <= 121:
+            raise ValueError(f"Write Quantity（写数量）范围 1 ~ 121，你填的是 {len(w_vals)}")
+        body = b"".join(struct.pack(">H", v & 0xFFFF) for v in w_vals)
+        pdu = struct.pack(">BHHHHB", 23, r_addr, r_qty, w_addr,
+                          len(w_vals), len(body)) + body
+        resp = self.mb.request(pdu)
+        nb = resp[1]
+        return list(struct.unpack(">" + "H" * (nb // 2), resp[2:2 + nb]))
+
+    def _fc23_dialog(self):
+        top = tk.Toplevel(self)
+        top.title(f"23 读写多个寄存器 —— 数据区 {self.index}")
+        top.transient(self)
+        top.grab_set()
+
+        f = ttk.Frame(top, padding=12)
+        f.pack(fill="both", expand=True)
+        v_waddr = tk.StringVar(value=str(self.addr))
+        v_wqty = tk.StringVar(value="4")
+        v_raddr = tk.StringVar(value=str(self.addr))
+        v_rqty = tk.StringVar(value="4")
+
+        ttk.Label(f, text="写起始地址").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=v_waddr, width=12).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(f, text="写数量").grid(row=0, column=2, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=v_wqty, width=8).grid(row=0, column=3, sticky="w", padx=8)
+        ttk.Label(f, text="写入值（每行或逗号分隔，0 ~ 65535）").grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        txt_w = tk.Text(f, width=36, height=5, font=("Consolas", 10))
+        txt_w.grid(row=2, column=0, columnspan=4, sticky="we")
+        ttk.Label(f, text="读起始地址").grid(row=3, column=0, sticky="w", pady=(8, 3))
+        ttk.Entry(f, textvariable=v_raddr, width=12).grid(row=3, column=1, sticky="w", padx=8)
+        ttk.Label(f, text="读数量").grid(row=3, column=2, sticky="w", pady=3)
+        ttk.Entry(f, textvariable=v_rqty, width=8).grid(row=3, column=3, sticky="w", padx=8)
+        ttk.Label(f, text="※ 同一帧里先写后读；读写地址可以不同。",
+                  foreground="#666").grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        lbl_res = ttk.Label(f, text="", font=("Consolas", 10), justify="left")
+        lbl_res.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        def run():
+            try:
+                w_addr = int(v_waddr.get(), 0)
+                r_addr = int(v_raddr.get(), 0)
+                r_qty = int(v_rqty.get(), 0)
+                w_n = int(v_wqty.get(), 0)
+                vals = [int(x, 0) for x in
+                        txt_w.get("1.0", "end").replace(",", " ").split()]
+                if any(not 0 <= v <= 0xFFFF for v in vals):
+                    raise ValueError("写入值必须在 0 ~ 65535 之间")
+                if len(vals) != w_n:
+                    raise ValueError(f"写数量填的是 {w_n}，但下面给了 {len(vals)} 个值")
+                if any(not 0 <= a <= 65535 for a in (w_addr, r_addr)):
+                    raise ValueError("地址必须在 0 ~ 65535 之间")
+            except ValueError as e:
+                messagebox.showerror("参数错误", str(e), parent=top)
+                return
+            try:
+                got = self._do_fc23(w_addr, vals, r_addr, r_qty)
+            except core.ModbusError as e:
+                lbl_res.configure(text=f"从站返回异常：{core.exc_text(e.code)}",
+                                  foreground="#c00")
+                return
+            except Exception as e:
+                lbl_res.configure(text=f"{type(e).__name__}: {e}", foreground="#c00")
+                return
+            show = ", ".join(str(x) for x in got[:16]) + ("…" if len(got) > 16 else "")
+            lbl_res.configure(
+                text=f"✔ 已写入 {len(vals)} 个；读回 {len(got)} 个：\n{show}",
+                foreground="#060")
+            self._read_once()
+
+        bf = ttk.Frame(f)
+        bf.grid(row=6, column=0, columnspan=4, sticky="e", pady=(10, 0))
+        ttk.Button(bf, text="执行", command=run).pack(side="left", padx=4)
+        ttk.Button(bf, text="关闭", command=top.destroy).pack(side="left")
+        self.wait_window(top)
+
+    # ------------------------------------------------------------ FC43/14 读设备标识
+    def _read_device_id(self, code, obj_id=0):
+        """43/14 读设备标识；按 moreFollows 自动翻页。
+        返回 (conformity, {对象ID: bytes})"""
+        objs = {}
+        obj = obj_id
+        conformity = 0
+        for _ in range(50):                        # 翻页安全上限（真实设备单次也不会超几页）
+            resp = self.mb.request(struct.pack(">BBBB", 0x2B, 0x0E, code, obj))
+            if len(resp) < 7 or resp[0] != 0x2B or resp[1] != 0x0E:
+                raise ValueError(f"读设备标识应答格式不对：{resp.hex(' ').upper()}")
+            conformity, more, nxt, num = resp[3], resp[4], resp[5], resp[6]
+            pos = 7
+            for _i in range(num):
+                if pos + 2 > len(resp):
+                    raise ValueError("读设备标识应答对象被截断")
+                oid, ln = resp[pos], resp[pos + 1]
+                val = resp[pos + 2:pos + 2 + ln]
+                if len(val) < ln:
+                    raise ValueError("读设备标识应答对象被截断")
+                objs[oid] = val
+                pos += 2 + ln
+            if more != 0xFF:
+                break
+            obj = nxt
+        return conformity, objs
+
+    def _devid_dialog(self):
+        if not self.mb.connected:
+            messagebox.showwarning("未连接", "读设备标识需要先连接从站（F3）")
+            return
+        top = tk.Toplevel(self)
+        top.title(f"43/14 读设备标识 —— 数据区 {self.index}")
+        top.transient(self)
+        top.grab_set()
+
+        f = ttk.Frame(top, padding=12)
+        f.pack(fill="both", expand=True)
+        CODES = ["01 基本 (Basic)", "02 常规 (Regular)",
+                 "03 扩展 (Extended)", "04 指定对象 (Individual)"]
+        v_code = tk.StringVar(value=CODES[0])
+        ttk.Label(f, text="读取码").grid(row=0, column=0, sticky="w", pady=3)
+        ttk.Combobox(f, textvariable=v_code, state="readonly", width=26,
+                     values=CODES).grid(row=0, column=1, sticky="w", padx=8)
+        ttk.Label(f, text="对象 ID（仅 04 用）").grid(row=1, column=0, sticky="w", pady=3)
+        v_obj = tk.StringVar(value="0")
+        ttk.Entry(f, textvariable=v_obj, width=10).grid(row=1, column=1, sticky="w", padx=8)
+
+        tv = ttk.Treeview(f, columns=("oid", "name", "val"), show="headings", height=8)
+        tv.heading("oid", text="对象")
+        tv.heading("name", text="名称")
+        tv.heading("val", text="值")
+        tv.column("oid", width=70, anchor="w", stretch=False)
+        tv.column("name", width=190, anchor="w", stretch=False)
+        tv.column("val", width=330, anchor="w")
+        tv.grid(row=3, column=0, columnspan=3, sticky="we", pady=(8, 0))
+
+        lbl = ttk.Label(f, text="", foreground="#666")
+        lbl.grid(row=4, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        def read():
+            try:
+                code = CODES.index(v_code.get()) + 1
+                obj = int(v_obj.get(), 0)
+                if not 0 <= obj <= 255:
+                    raise ValueError("对象 ID 范围 0 ~ 255")
+            except ValueError as e:
+                messagebox.showerror("参数错误", str(e), parent=top)
+                return
+            tv.delete(*tv.get_children())
+            try:
+                conformity, objs = self._read_device_id(code, obj)
+            except core.ModbusError as e:
+                lbl.configure(text=f"从站返回异常：{core.exc_text(e.code)}",
+                              foreground="#c00")
+                return
+            except Exception as e:
+                lbl.configure(text=f"{type(e).__name__}: {e}", foreground="#c00")
+                return
+            for oid in sorted(objs):
+                raw = objs[oid]
+                ascii_txt = "".join(chr(b) if 32 <= b < 127 else "·" for b in raw)
+                name = DEV_ID_NAMES.get(oid, "私有对象" if oid >= 0x80 else "")
+                tv.insert("", "end", values=(f"0x{oid:02X}", name,
+                                             f"{ascii_txt}   [{raw.hex(' ').upper()}]"))
+            lbl.configure(text=f"✔ 共 {len(objs)} 个对象；conformity = 0x{conformity:02X}",
+                          foreground="#060")
+
+        bf = ttk.Frame(f)
+        bf.grid(row=5, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(bf, text="读取", command=read).pack(side="left", padx=4)
+        ttk.Button(bf, text="关闭", command=top.destroy).pack(side="left")
+        self.wait_window(top)
+
+    # ------------------------------------------------------------ 批量别名
+    def _apply_alias_batch(self, template, start=1):
+        """按模板给当前所有显示行生成别名；返回行数。
+        模板占位符：{n} 序号、{addr} 协议地址、{p} PLC 地址（Base 1 口径，固定）"""
+        step = self._row_step()
+        rows = max(1, self.qty // step)
+        base = {1: 1, 2: 10001, 4: 30001}.get(self.fc, 40001)
+        for i in range(rows):
+            addr = self.addr + i * step
+            txt = (template.replace("{n}", str(i + start))
+                           .replace("{addr}", str(addr))
+                           .replace("{p}", f"{addr + base:05d}"))
+            self.alias[addr] = txt
+        return rows
+
+    def _alias_batch_dialog(self):
+        top = tk.Toplevel(self)
+        top.title(f"批量生成别名 —— 数据区 {self.index}")
+        top.transient(self)
+        top.grab_set()
+        f = ttk.Frame(top, padding=12)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="模板：{n} 序号，{addr} 协议地址，{p} PLC 地址（Base 1）").grid(
+            row=0, column=0, sticky="w")
+        v_tpl = tk.StringVar(value="点{n}")
+        e = ttk.Entry(f, textvariable=v_tpl, width=32)
+        e.grid(row=1, column=0, sticky="we", pady=4)
+        e.focus_set()
+        nf = ttk.Frame(f)
+        nf.grid(row=2, column=0, sticky="w", pady=4)
+        ttk.Label(nf, text="起始序号").pack(side="left")
+        v_n0 = tk.StringVar(value="1")
+        ttk.Entry(nf, textvariable=v_n0, width=6).pack(side="left", padx=6)
+        lbl = ttk.Label(f, text="", foreground="#060")
+        lbl.grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        def apply():
+            try:
+                n0 = int(v_n0.get(), 0)
+            except ValueError:
+                messagebox.showerror("参数错误", "起始序号请输入整数", parent=top)
+                return
+            if not v_tpl.get().strip():
+                messagebox.showerror("参数错误", "模板不能为空", parent=top)
+                return
+            n = self._apply_alias_batch(v_tpl.get(), n0)
+            lbl.configure(text=f"✔ 已为 {n} 行生成别名")
+            self._refresh_grid()
+
+        def clear():
+            self.alias.clear()
+            self._refresh_grid()
+            lbl.configure(text="已清除全部别名")
+
+        bf = ttk.Frame(f)
+        bf.grid(row=4, column=0, sticky="e", pady=(8, 0))
+        ttk.Button(bf, text="应用", command=apply).pack(side="left", padx=4)
+        ttk.Button(bf, text="清除全部", command=clear).pack(side="left", padx=4)
+        ttk.Button(bf, text="关闭", command=top.destroy).pack(side="left")
+        self.wait_window(top)
+
     def _on_double_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
@@ -772,7 +1085,7 @@ class DataArea(tk.Toplevel):
     def _raw_number(self, vals, i):
         if self.fc in core.BIT_FUNCS:
             return 1.0 if vals[i] else 0.0
-        if self.fmt in ("Float", "Long"):
+        if self.fmt in STEP2_FORMATS:
             if i + 1 >= len(vals):
                 return None
             a, b = vals[i], vals[i + 1]
@@ -786,7 +1099,26 @@ class DataArea(tk.Toplevel):
             raw = struct.pack(">HH", a, b)
             if self.fmt == "Float":
                 return float(struct.unpack(">f", raw)[0])
+            if self.fmt == "UInt32":
+                return struct.unpack(">I", raw)[0]
             return float(struct.unpack(">i", raw)[0])
+        if self.fmt in STEP4_FORMATS:
+            if i + 3 >= len(vals):
+                return None
+            ws = list(vals[i:i + 4])
+            order = _order_of(self.word_order)
+            if order == "CDAB":                    # 字序颠倒（4 字倒排）
+                ws = ws[::-1]
+            elif order == "BADC":                  # 字内字节交换
+                ws = [_swap16(w) for w in ws]
+            elif order == "DCBA":                  # 全交换（倒排 + 字内交换）
+                ws = [_swap16(w) for w in reversed(ws)]
+            raw = struct.pack(">4H", *ws)
+            if self.fmt == "Double":
+                return float(struct.unpack(">d", raw)[0])
+            if self.fmt == "Int64":
+                return struct.unpack(">q", raw)[0]      # 64 位整数保持 int，避免浮点精度损失
+            return struct.unpack(">Q", raw)[0]
         v = vals[i]
         if self.fmt == "Signed":
             return float(v - 65536 if v >= 32768 else v)
@@ -798,15 +1130,22 @@ class DataArea(tk.Toplevel):
     def _format_value(self, vals, i):
         if self.fc in core.BIT_FUNCS:
             return "1  ON" if vals[i] else "0  OFF"
-        if self.fmt in ("Hex", "Binary"):
+        if self.fmt == "Hex":
+            return f"0x{vals[i]:04X}"
+        if self.fmt == "Binary":
+            return f"{vals[i]:016b}"
+        if self.fmt == "AsciiHex":
+            # 每个寄存器显示成两个 ASCII 字符（对标 Modbus Poll 的 "ASCII - Hex"）；
+            # 不可打印字节显示 ·
             v = vals[i]
-            return f"0x{v:04X}" if self.fmt == "Hex" else f"{v:016b}"
+            return "".join(chr(b) if 32 <= b < 127 else "·"
+                           for b in ((v >> 8) & 0xFF, v & 0xFF))
         n = self._raw_number(vals, i)
         if n is None:
             return "-"
-        if self.fmt == "Long":
+        if self.fmt in ("Long", "UInt32", "Int64", "UInt64"):
             return str(int(n))
-        if self.fmt == "Float":
+        if self.fmt in ("Float", "Double"):
             out = f"{self._scaled(n):.4f}"
         else:
             out = "%g" % self._scaled(n)
@@ -815,10 +1154,15 @@ class DataArea(tk.Toplevel):
     def _alarm_state(self, vals, i):
         if self.alarm_low is None and self.alarm_high is None:
             return None
+        if self.fmt == "AsciiHex":
+            return None                           # 非数值格式不参与越限判断
         n = self._raw_number(vals, i)
         if n is None:
             return None
-        val = n if self.fmt in ("Hex", "Binary", "Long") else self._scaled(n)
+        if self.fmt in ("Hex", "Binary", "Long", "UInt32", "Int64", "UInt64"):
+            val = n
+        else:
+            val = self._scaled(n)
         if ((self.alarm_low is not None and val < self.alarm_low) or
                 (self.alarm_high is not None and val > self.alarm_high)):
             return "alarm"
@@ -826,10 +1170,12 @@ class DataArea(tk.Toplevel):
 
     def _plot_value(self, vals, i):
         """曲线用的数值：与表格显示口径一致（该缩放的缩放）"""
+        if self.fmt == "AsciiHex":
+            return None                           # 纯字符显示，没有数值含义
         n = self._raw_number(vals, i)
         if n is None:
             return None
-        if self.fmt in ("Hex", "Binary", "Long"):
+        if self.fmt in ("Hex", "Binary", "Long", "UInt32", "Int64", "UInt64"):
             return n
         return self._scaled(n)
 
@@ -1006,7 +1352,11 @@ class DataArea(tk.Toplevel):
         self._refresh_grid()
 
     def _cycle_format(self):
-        self.fmt = core.FORMATS[(core.FORMATS.index(self.fmt) + 1) % len(core.FORMATS)]
+        try:
+            i = FORMATS_EXT.index(self.fmt)
+        except ValueError:
+            i = len(FORMATS_EXT) - 1
+        self.fmt = FORMATS_EXT[(i + 1) % len(FORMATS_EXT)]
         self._refresh_grid()
 
     def _disconnect(self):
@@ -1028,13 +1378,55 @@ class DataArea(tk.Toplevel):
         if not self.log_fh:
             return
         try:
+            o = self.log_opts
+            if o["changed_only"] and vals == self._last_log_vals:
+                return                            # 数值没变化，不记录
+            self._last_log_vals = list(vals)
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            if o["ms"]:
+                ts += ".%03d" % int((time.time() % 1) * 1000)
             cells = [str(int(v)) if isinstance(v, bool) else str(v) for v in vals]
-            line = time.strftime("%Y-%m-%d %H:%M:%S") + "," + ",".join(cells) + "\n"
+            line = ts + o["delim"] + o["delim"].join(cells) + "\n"
             with self.log_lock:
                 self.log_fh.write(line)
                 self.log_fh.flush()
         except Exception:
             pass
+
+    def _log_setup_dialog(self):
+        """记录设置（对标 Modbus Poll 的 Log Setup，先设后记）"""
+        top = tk.Toplevel(self)
+        top.title(f"记录设置 —— 数据区 {self.index}")
+        top.transient(self)
+        top.grab_set()
+        f = ttk.Frame(top, padding=12)
+        f.pack(fill="both", expand=True)
+
+        DELIMS = [("逗号 ,", ","), ("制表符 \\t", "\t"), ("分号 ;", ";")]
+        cur = next((lab for lab, d in DELIMS if d == self.log_opts["delim"]), DELIMS[0][0])
+        v_delim = tk.StringVar(value=cur)
+        df = ttk.LabelFrame(f, text="分隔符", padding=8)
+        df.pack(fill="x")
+        for lab, _d in DELIMS:
+            ttk.Radiobutton(df, text=lab, variable=v_delim,
+                            value=lab).pack(side="left", padx=(0, 12))
+        v_ms = tk.BooleanVar(value=self.log_opts["ms"])
+        v_chg = tk.BooleanVar(value=self.log_opts["changed_only"])
+        ttk.Checkbutton(f, text="时间戳含毫秒（快周期采样对日志时用）",
+                        variable=v_ms).pack(anchor="w", pady=(10, 2))
+        ttk.Checkbutton(f, text="数值无变化时不记录（长期挂机记录用）",
+                        variable=v_chg).pack(anchor="w")
+
+        def ok():
+            d = {lab: d for lab, d in DELIMS}[v_delim.get()]
+            self.log_opts.update(delim=d, ms=v_ms.get(), changed_only=v_chg.get())
+            top.destroy()
+
+        bf = ttk.Frame(f)
+        bf.pack(fill="x", pady=(10, 0))
+        ttk.Button(bf, text="OK", command=ok).pack(side="right", padx=4)
+        ttk.Button(bf, text="Cancel", command=top.destroy).pack(side="right")
+        self.wait_window(top)
 
     def _toggle_log(self, start):
         if not start:
@@ -1057,11 +1449,12 @@ class DataArea(tk.Toplevel):
         if not path:
             return
         step = self._row_step()
+        delim = self.log_opts["delim"]
         header = ["时间"] + [self._disp_addr(self.addr + i * step)
                             for i in range(max(1, self.qty // step))]
         try:
             fh = open(path, "w", encoding="utf-8-sig", newline="")
-            fh.write(",".join(str(h) for h in header) + "\n")
+            fh.write(delim.join(str(h) for h in header) + "\n")
             fh.flush()
         except Exception as e:
             messagebox.showerror("打开文件失败", str(e))
@@ -1069,6 +1462,7 @@ class DataArea(tk.Toplevel):
         with self.log_lock:
             self.log_fh = fh
             self.log_path = path
+            self._last_log_vals = None            # 首行必写（配合"仅变化时记录"）
         messagebox.showinfo("开始记录", f"写入：\n{path}")
 
     # ------------------------------------------------------------ 配置
@@ -1094,6 +1488,8 @@ class DataArea(tk.Toplevel):
         self.qty = int(cfg.get("qty", 10))
         self.scan_rate = int(cfg.get("scan_rate", 1000))
         self.fmt = cfg.get("fmt", "Signed")
+        if self.fmt not in FORMATS_EXT:           # 配置里出现未知格式值时回退
+            self.fmt = "Signed"
         self.word_order = _order4_label(cfg.get("word_order", ORDER4[0]))
         self.var_base.set(int(cfg.get("base", 0)))
         self.scale = float(cfg.get("scale", 1.0))
@@ -1555,6 +1951,11 @@ class PollLiteMDI(tk.Tk):
         a.add_command(label="掩码写寄存器 (22)…", command=self._c("_mask_write_dialog"))
         a.add_command(label="脉冲写（点动）…", command=self._c("_pulse_write_dialog"))
         a.add_separator()
+        a.add_command(label="23 读写多个寄存器…", command=self._c("_fc23_dialog"))
+        a.add_command(label="43/14 读设备标识…", command=self._c("_devid_dialog"))
+        a.add_separator()
+        a.add_command(label="批量生成别名…", command=self._c("_alias_batch_dialog"))
+        a.add_separator()
         a.add_command(label="Test Center（手动构造报文）…", command=self._c("dlg_testcenter"))
         m.add_cascade(label="数据区", menu=a)
 
@@ -1568,6 +1969,7 @@ class PollLiteMDI(tk.Tk):
         d.add_command(label="实时曲线", command=self._c("dlg_chart"))
         d.add_command(label="报文 (Communication)", command=self._c("dlg_traffic"))
         d.add_separator()
+        d.add_command(label="记录设置…", command=self._c("_log_setup_dialog"))
         d.add_command(label="开始记录到 CSV…", command=self._c("_toggle_log", True))
         d.add_command(label="停止记录 CSV", command=self._c("_toggle_log", False))
         m.add_cascade(label="显示", menu=d)
@@ -1576,6 +1978,10 @@ class PollLiteMDI(tk.Tk):
         v.add_command(label="机器人地址表", command=lambda: dlg_robot_ranges(self))
         v.add_command(label="Modbus 设备扫描…", command=self._c("dlg_scanner"))
         v.add_command(label="地址扫描…", command=self._c("dlg_scan"))
+        v.add_separator()
+        v.add_command(label="清零全部窗口 Tx/Err 计数", command=self.reset_all_counters)
+        v.add_command(label="统一设置从站号…", command=self.set_all_unit)
+        v.add_command(label="统一设置扫描周期…", command=self.set_all_scan_rate)
         m.add_cascade(label="视图", menu=v)
 
         self.win_menu = tk.Menu(m, tearoff=0)
@@ -1603,6 +2009,52 @@ class PollLiteMDI(tk.Tk):
         if area is not None and area.winfo_exists():
             area.var_base.set(v)
             area._refresh_grid()
+
+    # ------------------------------------------------ 批量操作（对标 MP 的 for all windows）
+    def reset_all_counters(self):
+        """清零所有数据区的 Tx / Err 计数"""
+        for area in list(self.areas):
+            if area.winfo_exists():
+                area.mb.tx = 0
+                area.mb.err = 0
+                area._update_status()
+
+    def _apply_all_unit(self, v):
+        """统一设置从站号（应用到所有数据区）；范围非法返回 False"""
+        if not 0 <= v <= 255:
+            messagebox.showerror("参数错误", "从站号范围 0 ~ 255")
+            return False
+        for area in list(self.areas):
+            if area.winfo_exists():
+                area.slave_id = v
+                area.mb.unit = v
+                area._update_status()
+                area._refresh_grid()
+        return True
+
+    def set_all_unit(self):
+        v = core.simpledialog_int(self, "统一设置从站号",
+                                  "从站号（0 ~ 255，应用到所有数据区）：")
+        if v is not None:
+            self._apply_all_unit(v)
+
+    def _apply_all_scan_rate(self, v):
+        """统一设置扫描周期（应用到所有数据区）；非法返回 False"""
+        if v < 50:
+            messagebox.showerror("参数错误", "扫描周期不能小于 50 ms")
+            return False
+        for area in list(self.areas):
+            if area.winfo_exists():
+                area.scan_rate = v
+                area._update_status()
+                area._refresh_grid()
+        return True
+
+    def set_all_scan_rate(self):
+        v = core.simpledialog_int(self, "统一设置扫描周期",
+                                  "扫描周期 ms（≥50，应用到所有数据区）：")
+        if v is not None:
+            self._apply_all_scan_rate(v)
 
     def set_active(self, area):
         if area is self.active:
@@ -1732,6 +2184,33 @@ MDI_HELP = """多窗口版说明
           各通道 Y1 → Y2 —— 游标当前位置**下方**的波形值，运行中实时刷新
           Δ               —— 幅值差
       ⚠ 游标拖到数据范围之外会显示「—」而不是 0 —— 那不是"没变化"，是没有数据。
+
+五、显示格式（F8 → 显示格式）
+    Signed / Unsigned / Hex / Binary —— 单个寄存器（16 位）
+    AsciiHex                —— 每个寄存器显示成两个 ASCII 字符（不可打印的显示 ·）
+    Float / Long（32 位，占 2 个寄存器）、Int64 / UInt64 / Double（64 位，占 4 个）
+        —— 都要配「多寄存器字节序」：大端 / 字交换 / 字节交换 / 全交换。
+    常用参考：机器人位置值多为 32 位浮点、大端（ABCD）；部分仪表是 CDAB 字交换。
+    ⚠ 64 位格式暂不支持写入（双击写入仍按 16 位寄存器单点写）。
+
+六、功能码 23 / 43
+    23 读写多个寄存器：数据区菜单打开，同一帧里先写后读（规范语义），
+       读写地址可以不同；写数量上限 121、读数量上限 125。
+    43/14 读设备标识：读出厂商名 / 产品代码 / 版本等；
+       四种读取码（基本 / 常规 / 扩展 / 指定对象），多页应答自动翻页。
+       手里有不明设备时先读这个，能认出型号。
+
+七、UDP 连接（F3 的「连接方式」下拉）
+    除 Modbus TCP 外还有：Modbus UDP / RTU over TCP / ASCII over TCP /
+    RTU over UDP / ASCII over UDP（帧格式按 RTU/ASCII 走网线或 UDP）。
+    UDP 无连接：从站不响应就是超时，没有"连接被拒绝"这种即时反馈。
+    本机练手：从站模拟器加 --udp 即同时监听 UDP。
+
+八、记录设置与批量操作
+    显示 → 记录设置：分隔符（逗号/制表符/分号）、时间戳毫秒、
+       数值无变化时不记录（长期挂机记录用）。
+    数据区 → 批量生成别名：模板占位符 {n} 序号 / {addr} 协议地址 / {p} PLC 地址。
+    视图 → 清零全部窗口计数 / 统一设置从站号 / 统一设置扫描周期。
 
 ⚠ 连接数提醒
     每个数据区是独立连接。机器人控制器**最多只支持 4 个 Modbus 连接**，
